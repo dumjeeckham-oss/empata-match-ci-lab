@@ -7,7 +7,12 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import type { EventFormAnswers, EventFormField } from "@/types/eventForms";
 
 const emulatorAvailable = Boolean(process.env.FIRESTORE_EMULATOR_HOST && process.env.FIREBASE_AUTH_EMULATOR_HOST);
-const projectId = "demo-dongbaek-forms";
+const projectId = process.env.FIREBASE_PROJECT_ID || "demo-dongbaek-forms";
+const authEmulatorHost = process.env.FIREBASE_AUTH_EMULATOR_HOST || "127.0.0.1:9099";
+const firestoreEmulatorHost = process.env.FIRESTORE_EMULATOR_HOST || "127.0.0.1:8081";
+const functionsEmulatorHost = process.env.FIREBASE_FUNCTIONS_EMULATOR_HOST || "127.0.0.1:5001";
+const [functionsHost, functionsPortText] = functionsEmulatorHost.split(":");
+const functionsPort = Number(functionsPortText || 5001);
 vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
 type FormSetup = { formId: string; publicToken: string; roundId: string; versionId: string };
@@ -64,7 +69,7 @@ describe.skipIf(!emulatorAvailable)("행사 폼 Functions 자체 보안", () => 
     const adminApp = initializeAdminApp({ projectId }, `claims-${Date.now()}`);
     const createAccount = async (app: FirebaseApp, prefix: string, role?: "admin" | "social_worker") => {
       const auth = getAuth(app);
-      connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
+      connectAuthEmulator(auth, `http://${authEmulatorHost}`, { disableWarnings: true });
       const credential = await createUserWithEmailAndPassword(auth, `${prefix}-${Date.now()}@example.test`, "emulator-only-password");
       if (role) {
         await getAdminAuth(adminApp).setCustomUserClaims(credential.user.uid, { role });
@@ -78,15 +83,15 @@ describe.skipIf(!emulatorAvailable)("행사 폼 Functions 자체 보안", () => 
     publicFunctions = getFunctions(publicApp, "asia-northeast3");
     socialWorkerFunctions = getFunctions(socialWorkerApp, "asia-northeast3");
     generalFunctions = getFunctions(generalApp, "asia-northeast3");
-    connectFunctionsEmulator(managerFunctions, "127.0.0.1", 5001);
-    connectFunctionsEmulator(publicFunctions, "127.0.0.1", 5001);
-    connectFunctionsEmulator(socialWorkerFunctions, "127.0.0.1", 5001);
-    connectFunctionsEmulator(generalFunctions, "127.0.0.1", 5001);
+    connectFunctionsEmulator(managerFunctions, functionsHost, functionsPort);
+    connectFunctionsEmulator(publicFunctions, functionsHost, functionsPort);
+    connectFunctionsEmulator(socialWorkerFunctions, functionsHost, functionsPort);
+    connectFunctionsEmulator(generalFunctions, functionsHost, functionsPort);
     await deleteAdminApp(adminApp);
   });
 
   beforeEach(async () => {
-    const response = await fetch(`http://127.0.0.1:8081/emulator/v1/projects/${projectId}/databases/(default)/documents`, { method: "DELETE" });
+    const response = await fetch(`http://${firestoreEmulatorHost}/emulator/v1/projects/${projectId}/databases/(default)/documents`, { method: "DELETE" });
     expect(response.ok).toBe(true);
   });
 

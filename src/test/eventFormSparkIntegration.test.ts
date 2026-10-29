@@ -15,7 +15,9 @@ import type { EventFormField } from "@/types/eventForms";
 import { exportAllEventFormRounds, loadEventFormResetSummary, resetEventForm } from "@/lib/eventFormResetApi";
 
 const emulatorAvailable = Boolean(process.env.FIRESTORE_EMULATOR_HOST && process.env.FIREBASE_AUTH_EMULATOR_HOST);
-const projectId = "demo-dongbaek-forms";
+const projectId = process.env.FIREBASE_PROJECT_ID || "demo-dongbaek-forms";
+const authEmulatorHost = process.env.FIREBASE_AUTH_EMULATOR_HOST || "127.0.0.1:9099";
+const firestoreEmulatorHost = process.env.FIRESTORE_EMULATOR_HOST || "127.0.0.1:8081";
 vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
 describe.skipIf(!emulatorAvailable)("Spark 행사 폼 실제 Auth·Firestore 흐름", () => {
@@ -26,8 +28,8 @@ describe.skipIf(!emulatorAvailable)("Spark 행사 폼 실제 Auth·Firestore 흐
 
   beforeAll(async () => {
     const [authClear, firestoreClear] = await Promise.all([
-      fetch(`http://127.0.0.1:9099/emulator/v1/projects/${projectId}/accounts`, { method: "DELETE" }),
-      fetch(`http://127.0.0.1:8081/emulator/v1/projects/${projectId}/databases/(default)/documents`, { method: "DELETE" }),
+      fetch(`http://${authEmulatorHost}/emulator/v1/projects/${projectId}/accounts`, { method: "DELETE" }),
+      fetch(`http://${firestoreEmulatorHost}/emulator/v1/projects/${projectId}/databases/(default)/documents`, { method: "DELETE" }),
     ]);
     expect(authClear.ok).toBe(true);
     expect(firestoreClear.ok).toBe(true);
