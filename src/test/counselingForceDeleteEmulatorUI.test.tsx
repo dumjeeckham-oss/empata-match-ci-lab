@@ -52,7 +52,7 @@ describe.skipIf(!process.env.FIRESTORE_EMULATOR_HOST || !process.env.FIREBASE_AU
   expect(response.ok).toBe(true); await user.getIdTokenResult(true);
  }
 
- it("FD1-FD7: actual pending list, both cancel gates, confirmed delete, formal/other memo retention",async()=>{
+ it("FD1-FD7: pending list opens the normal transcription flow and preserves the safe lifecycle",async()=>{
   await login();const db=boundary.db!,uid=boundary.auth!.currentUser!.uid;
   const seed:HandwritingMemo={id:"fd-a",schemaVersion:1,targetType:"이용자",targetId:"fd-target-a",targetKey:"user:fd-target-a",counselingRecordId:"",createdBy:uid,updatedBy:uid,createdAt:null,updatedAt:null,revision:0,width:1600,height:1000,strokesJson:"[]",transcribedRevision:-1,transcribedAt:null};
   await handwritingApi.save(seed,"[]",false);
@@ -63,10 +63,32 @@ describe.skipIf(!process.env.FIRESTORE_EMULATOR_HOST || !process.env.FIREBASE_AU
   await handwritingApi.save({...seed,id:"fd-b",targetId:"fd-target-b",targetKey:"user:fd-target-b"},"[]",false);
   render(<PendingHandwritingMemos targetName={(_type,id)=>id}/>);
   const open=await screen.findByRole("button",{name:"fd-target-a 열기"},{timeout:10000}),row=open.parentElement!;
-  const remove=within(row).getByRole("button",{name:"옮겨 적은 후 삭제"});expect(remove).toBeEnabled();
-  vi.mocked(window.confirm).mockReturnValueOnce(false);fireEvent.click(remove);expect((await memo()).exists()).toBe(true);expect((await memo()).data()).not.toHaveProperty("forceDeleteConfirmedBy");
-  vi.mocked(window.confirm).mockReturnValueOnce(true).mockReturnValueOnce(false);fireEvent.click(remove);expect((await memo()).exists()).toBe(true);expect((await memo()).data()).not.toHaveProperty("forceDeleteConfirmedBy");
-  fireEvent.click(remove);await screen.findByText("임시 손글씨를 삭제했습니다.",{}, {timeout:10000});
-  expect((await memo()).exists()).toBe(false);expect((await getDoc(doc(db,COUNSELING_COLLECTION,recordId))).data()?.content).toBe("formal retained");expect((await getDoc(doc(db,COUNSELING_HANDWRITING_COLLECTION,"fd-b"))).exists()).toBe(true);
+  expect(within(row).queryByRole("button",{name:"옮겨 적은 후 삭제"})).not.toBeInTheDocument();
+  fireEvent.click(open);
+  expect(await screen.findByRole("button",{name:"전사 완료 · 손글씨 삭제"},{timeout:10000})).toBeInTheDocument();
+  expect((await memo()).exists()).toBe(true);
+  const changed = (await memo()).data() as HandwritingMemo;
+  expect(changed.revision).toBeGreaterThan(changed.transcribedRevision);
+  expect(changed.transcribedRevision).toBe(-1);
+  expect(changed.transcribedAt).toBeNull();
+  expect(changed.confirmedBy).toBe("");
+  expect(changed.confirmedAt).toBeNull();
+  expect((await memo()).exists()).toBe(true);
+
+  // The current pending-list UI has no re-transcribe/re-confirm action. Verify
+  // that recovery through the actual API contract is still safe and complete.
+  const recordBeforeRetry = await getDoc(doc(db, COUNSELING_COLLECTION, recordId));
+  const retranscribedId = await handwritingApi.saveTranscription(changed, {
+   targetType: seed.targetType, targetId: seed.targetId, targetName: "synthetic",
+   content: "formal retained", result: "", date: "2026-10-06", category: "일반상담", counselorName: "synthetic"
+  }, recordBeforeRetry.data()?.updatedAt);
+  expect(retranscribedId).toBe(recordId);
+  const retranscribed = await read();
+  expect(retranscribed.transcribedRevision).toBe(retranscribed.revision);
+  await handwritingApi.confirmTranscription(retranscribed, 2);
+  await handwritingApi.deleteConfirmed(await read());
+  expect((await memo()).exists()).toBe(false);
+  expect((await getDoc(doc(db, COUNSELING_COLLECTION, recordId))).data()?.content).toBe("formal retained");
+  expect((await getDoc(doc(db, COUNSELING_HANDWRITING_COLLECTION, "fd-b"))).exists()).toBe(true);
  },20000);
 });

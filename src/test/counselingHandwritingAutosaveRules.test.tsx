@@ -63,7 +63,8 @@ describe.skipIf(!process.env.FIRESTORE_EMULATOR_HOST)("candidate Rules와 실제
     } finally { cleanup(); await environment.cleanup(); await deleteApp(app); }
   }, 30000);
   it("FD14: real remote force deletion retains dirty hook and blocks resurrection", async () => {
-    const env = await initializeTestEnvironment({ projectId: "demo-dongbaek-forms", firestore: { rules: readFileSync("firestore.rules", "utf8") } });
+    const rulesPath = process.env.HANDWRITING_RULES_FIXTURE || "src/test/fixtures/handwriting-safe-delete-v2.rules";
+    const env = await initializeTestEnvironment({ projectId: "demo-dongbaek-forms", firestore: { rules: readFileSync(rulesPath, "utf8") } });
     try {
       await env.clearFirestore();
       const db = env.authenticatedContext("device-a", { role: "admin" }).firestore() as unknown as Firestore;
