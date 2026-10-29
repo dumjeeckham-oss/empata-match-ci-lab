@@ -60,6 +60,9 @@ jobs:
       - name: Install dependencies
         run: npm ci --legacy-peer-deps
 
+      - name: Install Functions dependencies
+        run: npm --prefix functions ci --legacy-peer-deps
+
       - name: Start isolated Auth and Firestore emulators
         run: >-
           npx firebase emulators:exec

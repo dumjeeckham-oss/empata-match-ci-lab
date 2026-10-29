@@ -1,0 +1,16 @@
+name: Isolated App Check contract fixture
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  app-check-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify build variable contract
+        env:
+          VITE_APP_CHECK_SITE_KEY: ${{ vars.VITE_APP_CHECK_SITE_KEY }}
+        run: echo "Static contract only; no deployment is performed."

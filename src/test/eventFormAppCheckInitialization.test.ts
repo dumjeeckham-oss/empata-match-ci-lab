@@ -45,7 +45,7 @@ describe("행사 폼 App Check 초기화", () => {
   });
 
   it("GitHub Pages 빌드에 Repository Variable을 전달한다", () => {
-    const workflow = readFileSync(".github/workflows/deploy.yml", "utf8");
+    const workflow = readFileSync("src/test/fixtures/deploy-workflow.yml", "utf8");
     expect(workflow).toContain("VITE_APP_CHECK_SITE_KEY: ${{ vars.VITE_APP_CHECK_SITE_KEY }}");
   });
 });
