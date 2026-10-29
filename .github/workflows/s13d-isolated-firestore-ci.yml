@@ -1,0 +1,73 @@
+name: S13-D Isolated Firestore CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: s13d-isolated-firestore-ci
+  cancel-in-progress: true
+
+jobs:
+  static-node20:
+    name: Static checks (Node 20)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: TypeScript
+        run: npx tsc --noEmit -p tsconfig.app.json
+
+      - name: Production build
+        run: npm run build
+
+  emulator-node24:
+    name: Emulator and Rules tests (Node 24)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FIREBASE_CONFIG: firebase.handwriting-v2-test.json
+      FIREBASE_PROJECT_ID: s13d-ci-emulator-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Start isolated Auth and Firestore emulators
+        run: >-
+          npx firebase emulators:exec
+          --only auth,firestore
+          --project s13d-ci-emulator-test
+          --config firebase.handwriting-v2-test.json
+          "npm test -- --run --maxWorkers=1 --no-file-parallelism"
+
+      - name: Build verification
+        run: npm run build
+

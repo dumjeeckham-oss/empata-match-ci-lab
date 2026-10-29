@@ -1,0 +1,945 @@
+import { Checkbox } from "@/components/ui/checkbox";
+import { useMemo, useState, useEffect } from "react";
+import { useCollection } from "@/hooks/useFirestore";
+import { type ServiceUser, type Worker, type MatchResult, type CounselingRecord, type MatchingHistoryRecord, SUPPORT_TYPES } from "@/types";
+import { matchUserWithWorkers } from "@/lib/matching";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { toast } from "@/hooks/use-toast";
+import { USERS_COLLECTION, WORKERS_COLLECTION, MATCHING_HISTORY_COLLECTION } from "@/lib/collectionNames";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { daysBetween, isWithinRecentMonths, percent } from "@/lib/dashboardStats";
+import { formatVoucherTier } from "@/lib/userVoucher";
+import { formatRequiredVoucherGap } from "@/lib/serviceHours";
+import {
+  formatUserMatchingTime,
+  formatUserVoucherHours,
+  formatWorkerMatchingTime,
+  getUserCautionTags,
+  getUserRequestTags,
+  getWorkerAvailableTags,
+  getWorkerUnavailableTags,
+} from "@/lib/matchingCardInfo";
+import { recordMatchingFailure, MATCHING_FAILURE_REASONS, MATCHING_FAILURE_SCORE_DELTA } from "@/lib/matchingFailure";
+import { getWorkerStatusBadges, isWorkerWaitingForMatch } from "@/lib/statusLifecycle";
+import { matchesWorkerFilters, type WorkerTimeBand } from "@/lib/workerFilters";
+
+const FAILURE_REASONS = MATCHING_FAILURE_REASONS;
+const FAILURE_SCORE_DELTA = MATCHING_FAILURE_SCORE_DELTA;
+
+const getHistoryStatus = (record: MatchingHistoryRecord) => {
+  if (record.type === "실패") return "매칭 실패";
+  if (record.type === "시도") return "매칭 시도중";
+  if (record.type === "매칭") return "매칭 완료";
+  if (record.status) return record.status;
+  return "해제";
+};
+
+const getPairRejectionScore = (user: ServiceUser | undefined, worker: Worker | undefined) => {
+  if (!user?.id || !worker?.id) return 0;
+  const userScore = Number(user.rejectionScores?.[worker.id] || 0);
+  const workerScore = Number(worker.rejectionScores?.[user.id] || 0);
+  const score = Math.max(userScore, workerScore);
+  return Number.isFinite(score) ? score : 0;
+};
+
+const Matching = () => {
+  const { data: usersRaw, update: updateUser, loading: usersLoading, error: usersError } = useCollection<ServiceUser>(USERS_COLLECTION);
+  const { data: workersRaw, update: updateWorker, loading: workersLoading, error: workersError } = useCollection<Worker>(WORKERS_COLLECTION);
+  const { data: counselingRecordsRaw, loading: counselingLoading, error: counselingError } = useCollection<CounselingRecord>("counseling");
+  const { data: matchingHistoryRaw, loading: historyLoading, error: historyError } = useCollection<MatchingHistoryRecord>(MATCHING_HISTORY_COLLECTION);
+  const users = usersRaw || [];
+  const workers = workersRaw || [];
+  const counselingRecords = counselingRecordsRaw || [];
+  const matchingHistory = matchingHistoryRaw || [];
+
+  const [nameSearch, setNameSearch] = useState<string>("");
+  const [filterForeigners, setFilterForeigners] = useState(false);
+  const [filterWeekend, setFilterWeekend] = useState(false);
+  const [filterCanDrive, setFilterCanDrive] = useState(false);
+  const [supportFilters, setSupportFilters] = useState<string[]>([]);
+  const [genderFilters, setGenderFilters] = useState<string[]>([]);
+  const [ageRange, setAgeRange] = useState<[number, number]>([20, 70]);
+  const [ageFilterActive, setAgeFilterActive] = useState(false);
+  const [timeBandFilters, setTimeBandFilters] = useState<WorkerTimeBand[]>([]);
+  const [capabilityFilters, setCapabilityFilters] = useState<string[]>([]);
+  const [selectedUserId, setSelectedUserId] = useState<string>("");
+  const [results, setResults] = useState<MatchResult[]>([]);
+  const [manualSearch, setManualSearch] = useState<string>("");
+  const [manualWorkerId, setManualWorkerId] = useState<string>("");
+  const [summaryModal, setSummaryModal] = useState<{
+    title: string;
+    rows: Array<{ id: string; name: string; date: string; status: string; note: string; userId?: string; workerId?: string }>;
+  } | null>(null);
+  const [failureDialog, setFailureDialog] = useState<{ user: ServiceUser & { id: string }; worker: Worker & { id: string }; score: number } | null>(null);
+  const [failureReason, setFailureReason] = useState<string>(FAILURE_REASONS[0]);
+  const [failureDetail, setFailureDetail] = useState("");
+
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+
+  const openWorkerDetail = (worker: Worker) => {
+    if (worker.id) navigate(`/workers?detailId=${encodeURIComponent(worker.id)}`);
+  };
+
+  useEffect(() => {
+    const uid = searchParams.get("userId");
+    if (uid) {
+      setSelectedUserId(uid);
+    }
+  }, [searchParams]);
+
+  const toggleSupportFilter = (type: string) => {
+    setSupportFilters((prev) =>
+      prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type]
+    );
+  };
+
+  const openFailureDialog = (worker: Worker, score: number) => {
+    if (!selectedUser?.id || !worker.id) return;
+    setFailureReason(FAILURE_REASONS[0]);
+    setFailureDetail("");
+    setFailureDialog({ user: selectedUser as ServiceUser & { id: string }, worker: worker as Worker & { id: string }, score });
+  };
+
+  const saveMatchingFailure = async () => {
+    if (!failureDialog) return;
+    const { user, worker } = failureDialog;
+    const detail = failureDetail.trim();
+    await recordMatchingFailure({
+      type: "실패",
+      status: "매칭 실패",
+      userId: user.id,
+      userName: user.name,
+      userPhone: user.phone,
+      workerId: worker.id,
+      workerName: worker.name,
+      workerPhone: worker.phone,
+      date: new Date().toISOString().slice(0, 10),
+      failureReason,
+      reasonDetail: detail || undefined,
+      rejectionScoreDelta: FAILURE_SCORE_DELTA,
+      notes: [failureReason, detail].filter(Boolean).join(" - "),
+    }, user, worker);
+    setFailureDialog(null);
+    toast({ title: "매칭 실패 이력 저장", description: "이 조합의 거부점수가 추천 결과에 반영됩니다." });
+  };
+
+  const waitingUsers = users.filter((u) => u.contractStatus === "대기");
+  const waitingWorkers = workers.filter((worker) => isWorkerWaitingForMatch(worker));
+  const selectedUser = users.find((u) => u.id === selectedUserId);
+
+  const filteredUsers = waitingUsers.filter((u) =>
+    u.name.toLowerCase().includes(nameSearch.toLowerCase())
+  );
+
+  const filteredWorkers = useMemo(() => {
+    return waitingWorkers.filter((w) => {
+      if (filterForeigners && !w.isForeigner) return false;
+      if (filterWeekend) {
+        const hasWeekend = String(w.availableDays || "").includes("토") || String(w.availableDays || "").includes("일") ||
+          (w.weeklySchedule?.some((d) => d.day === "토" || d.day === "일"));
+        if (!hasWeekend) return false;
+      }
+      if (supportFilters.length > 0 && !w.supportTypes?.some((t) => supportFilters.includes(t))) return false;
+      if (filterCanDrive && !w.canDrive) return false;
+      return matchesWorkerFilters(w, {
+        genders: genderFilters,
+        minAge: ageFilterActive ? ageRange[0] : undefined,
+        maxAge: ageFilterActive ? ageRange[1] : undefined,
+        timeBands: timeBandFilters,
+        canSupportDiaper: capabilityFilters.includes("diaper"),
+        noAnimalAllergy: capabilityFilters.includes("no-animal-allergy"),
+        canSupportAdults: capabilityFilters.includes("adults"),
+        canSupportMaleUsers: capabilityFilters.includes("male-users"),
+      });
+    });
+  }, [waitingWorkers, filterForeigners, filterWeekend, supportFilters, filterCanDrive, genderFilters, ageRange, ageFilterActive, timeBandFilters, capabilityFilters]);
+
+  const globalTopMatches = useMemo(() => {
+    return waitingUsers.map(u => {
+      const matchResults = matchUserWithWorkers(u, filteredWorkers);
+      const top3 = matchResults.slice(0, 3);
+      return { user: u, top3 };
+    }).filter(m => m.top3.length > 0 && m.top3[0].score >= 50)
+      .sort((a, b) => b.top3[0].score - a.top3[0].score)
+      .slice(0, 3);
+  }, [waitingUsers, filteredWorkers]);
+
+  const runMatching = () => {
+    if (!selectedUser) return;
+    const res = matchUserWithWorkers(selectedUser, filteredWorkers);
+    setResults(res);
+  };
+
+  const resetSearchFilters = () => {
+    setNameSearch("");
+    setManualSearch("");
+    setFilterForeigners(false);
+    setFilterWeekend(false);
+    setFilterCanDrive(false);
+    setSupportFilters([]);
+    setGenderFilters([]);
+    setAgeRange([20, 70]);
+    setAgeFilterActive(false);
+    setTimeBandFilters([]);
+    setCapabilityFilters([]);
+    setSelectedUserId("");
+    setManualWorkerId("");
+    setResults([]);
+    navigate("/matching");
+  };
+
+  const handleSelectUser = (userId: string) => {
+    setSelectedUserId(userId);
+    setResults([]);
+    navigate(`/matching?userId=${userId}`);
+  };
+
+  useEffect(() => {
+    if (selectedUserId && filteredWorkers.length > 0) {
+      const u = users.find(u => u.id === selectedUserId);
+      if (u) {
+        const res = matchUserWithWorkers(u, filteredWorkers);
+        setResults(res);
+      }
+    }
+  }, [selectedUserId, filteredWorkers, users]);
+
+  const selectedUserRecords = counselingRecords
+    .filter((r) => r.targetId === selectedUserId)
+    .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+
+  const displayedResults = results.slice(0, 3);
+
+  // 수동 매칭: 특정 활동지원사를 직접 선택해 점수를 확인
+  const allScored = useMemo(() => {
+    if (!selectedUser) return [];
+    return matchUserWithWorkers(selectedUser, filteredWorkers);
+  }, [selectedUser, filteredWorkers]);
+
+  const manualCandidates = allScored.filter((r) =>
+    (r.worker.name || "").toLowerCase().includes(manualSearch.toLowerCase())
+  );
+  const manualSelected = allScored.find((r) => r.worker.id === manualWorkerId);
+  const scoreByWorkerId = useMemo(
+    () => new Map(allScored.map((result) => [result.worker.id, result])),
+    [allScored],
+  );
+  const visibleWorkers = useMemo(() => {
+    const term = manualSearch.trim().toLowerCase();
+    if (!term) return filteredWorkers;
+    return filteredWorkers.filter((worker) =>
+      [worker.name, worker.phone, worker.address, worker.preferredArea]
+        .some((value) => String(value || "").toLowerCase().includes(term)),
+    );
+  }, [filteredWorkers, manualSearch]);
+  const recommendedRankByWorkerId = useMemo(
+    () => new Map(displayedResults.map((result, index) => [result.worker.id, index + 1])),
+    [displayedResults],
+  );
+
+  const matchingSummary = useMemo(() => {
+    const successful = matchingHistory.filter((record) => record.type === "매칭" && record.status !== "매칭 실패");
+    const failures = matchingHistory.filter((record) => record.type === "실패" || record.status === "매칭 실패");
+    const recentSuccessful = successful.filter((record) => isWithinRecentMonths(record.date));
+    const recentFailures = failures.filter((record) => isWithinRecentMonths(record.date));
+    const successRate = percent(recentSuccessful.length, recentSuccessful.length + recentFailures.length);
+    const durations = successful
+      .map((record) => {
+        const user = users.find((u) => u.id === record.userId);
+        return daysBetween(user?.receiptDate || user?.createdAt, record.date);
+      })
+      .filter((value): value is number => value !== null);
+    const avgDays = durations.length ? Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length) : 0;
+    const possibleRatio = waitingUsers.length ? percent(filteredWorkers.length, waitingUsers.length) : 0;
+    return {
+      totalSuccess: successful.length,
+      recentSuccess: recentSuccessful.length,
+      recentFailure: recentFailures.length,
+      successRate,
+      avgDays,
+      possibleRatio,
+      waitingUserCount: waitingUsers.length,
+      possibleWorkerCount: filteredWorkers.length,
+    };
+  }, [matchingHistory, users, waitingUsers.length, filteredWorkers.length]);
+
+  const openMatchingSummaryModal = (kind: "success" | "waiting" | "failure") => {
+    if (kind === "success") {
+      const rows = users.flatMap((user) => {
+        const helperIds = user.assignedHelperIds || [];
+        return helperIds.map((workerId) => {
+          const worker = workers.find((item) => item.id === workerId);
+          const matchLog = matchingHistory
+            .filter((record) => record.userId === user.id && record.workerId === workerId && record.type === "매칭")
+            .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")))[0];
+          return {
+            id: `success-${user.id}-${workerId}`,
+            name: `${user.name} - ${worker?.name || "지원사 미등록"}`,
+            date: matchLog?.date || user.serviceStartDate || worker?.serviceStartDate || "미등록",
+            status: "서비스중",
+            note: `${user.phone || "이용자 연락처 없음"} / ${worker?.phone || "지원사 연락처 없음"}`,
+            userId: user.id,
+            workerId,
+          };
+        });
+      });
+      setSummaryModal({ title: `매칭 성공(성사) 명단 (총 ${rows.length}쌍)`, rows });
+      return;
+    }
+
+    if (kind === "failure") {
+      const rows = matchingHistory
+        .filter((record) => record.type === "실패" || record.status === "매칭 실패")
+        .filter((record) => isWithinRecentMonths(record.date))
+        .map((record) => ({
+          id: `failure-${record.id || record.userId + record.workerId + record.date}`,
+          name: `${record.userName || "이용자 미등록"} - ${record.workerName || "지원사 미등록"}`,
+          date: record.date || "미등록",
+          status: getHistoryStatus(record),
+          note: [record.failureReason, record.reasonDetail, record.notes].filter(Boolean).join(" · ") || "실패 사유 미등록",
+          userId: record.userId,
+          workerId: record.workerId,
+        }));
+      setSummaryModal({ title: `최근 3개월 매칭 실패 명단 (총 ${rows.length}건)`, rows });
+      return;
+    }
+    const waitingUserRows = waitingUsers.map((user) => ({
+      id: `waiting-user-${user.id}`,
+      name: user.name,
+      date: user.receiptDate || "미등록",
+      status: "이용자 대기",
+      note: [user.requiredDays, user.requiredHours, user.preferredWorkerTraits].filter(Boolean).join(" · ") || "희망 조건 미등록",
+      userId: user.id,
+    }));
+    const waitingWorkerRows = waitingWorkers.map((worker) => ({
+      id: `waiting-worker-${worker.id}`,
+      name: worker.name,
+      date: worker.receiptDate || worker.serviceEndDate || "미등록",
+      status: "지원사 대기",
+      note: `${worker.phone || "연락처 없음"} · ${worker.preferredArea || "희망지역 미등록"}`,
+      workerId: worker.id,
+    }));
+    setSummaryModal({ title: `매칭 대기 명단 (총 ${waitingUserRows.length + waitingWorkerRows.length}명)`, rows: [...waitingUserRows, ...waitingWorkerRows] });
+  };
+
+  const openSummaryTarget = (row: { userId?: string; workerId?: string }) => {
+    setSummaryModal(null);
+    if (row.userId) {
+      handleSelectUser(row.userId);
+      return;
+    }
+    if (row.workerId) {
+      const worker = workers.find((item) => item.id === row.workerId);
+      if (worker) openWorkerDetail(worker);
+    }
+  };
+  if (usersLoading || workersLoading || counselingLoading || historyLoading) {
+    return (
+      <div className="flex items-center justify-center min-h-[300px]">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mx-auto mb-4" />
+          <p className="text-muted-foreground">매칭 데이터를 불러오는 중입니다...</p>
+        </div>
+      </div>
+    );
+  }
+
+  const loadError = usersError || workersError || counselingError || historyError;
+  if (loadError) {
+    return (
+      <div className="p-6 max-w-2xl mx-auto">
+        <div className="border border-destructive/30 rounded-lg p-6 bg-destructive/5">
+          <h2 className="text-lg font-semibold text-destructive mb-2">데이터를 불러오지 못했습니다</h2>
+          <p className="text-sm text-muted-foreground whitespace-pre-wrap">{loadError}</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h1 className="page-header mb-1">활동지원사 조건 검색·비교</h1>
+          <p className="text-sm text-muted-foreground">이용자 조건과 활동지원사 근무 조건을 확인하고, 후보별 추천점수를 비교합니다.</p>
+        </div>
+        <Badge variant="outline" className="w-fit">읽기 전용 비교 · 매칭 확정은 별도 동작</Badge>
+      </div>
+      <Card className="mb-6 border-primary/20">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">매칭 성과 대시보드</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-2 lg:grid-cols-7 gap-3">
+            <button type="button" onClick={() => openMatchingSummaryModal("success")} className="rounded-lg border bg-muted/30 p-3 text-left transition hover:shadow-md cursor-pointer">
+              <p className="text-xs text-muted-foreground">누적 매칭 성사</p>
+              <p className="text-2xl font-bold text-primary">{matchingSummary.totalSuccess}</p>
+            </button>
+            <button type="button" onClick={() => openMatchingSummaryModal("success")} className="rounded-lg border bg-muted/30 p-3 text-left transition hover:shadow-md cursor-pointer">
+              <p className="text-xs text-muted-foreground">3개월 성사</p>
+              <p className="text-2xl font-bold text-primary">{matchingSummary.recentSuccess}</p>
+            </button>
+            <button type="button" onClick={() => openMatchingSummaryModal("failure")} className="rounded-lg border bg-muted/30 p-3 text-left transition hover:shadow-md cursor-pointer">
+              <p className="text-xs text-muted-foreground">3개월 실패</p>
+              <p className="text-2xl font-bold text-destructive">{matchingSummary.recentFailure}</p>
+            </button>
+            <button type="button" onClick={() => openMatchingSummaryModal("success")} className="rounded-lg border bg-muted/30 p-3 text-left transition hover:shadow-md cursor-pointer">
+              <p className="text-xs text-muted-foreground">최근 성공률</p>
+              <p className="text-2xl font-bold">{matchingSummary.successRate}%</p>
+            </button>
+            <button type="button" onClick={() => openMatchingSummaryModal("success")} className="rounded-lg border bg-muted/30 p-3 text-left transition hover:shadow-md cursor-pointer">
+              <p className="text-xs text-muted-foreground">평균 소요 기간</p>
+              <p className="text-2xl font-bold">{matchingSummary.avgDays}<span className="text-sm text-muted-foreground">일</span></p>
+            </button>
+            <button type="button" onClick={() => openMatchingSummaryModal("waiting")} className="rounded-lg border bg-muted/30 p-3 text-left transition hover:shadow-md cursor-pointer">
+              <p className="text-xs text-muted-foreground">대기 이용자</p>
+              <p className="text-2xl font-bold">{matchingSummary.waitingUserCount}</p>
+            </button>
+            <button type="button" onClick={() => openMatchingSummaryModal("waiting")} className="rounded-lg border bg-muted/30 p-3 text-left transition hover:shadow-md cursor-pointer">
+              <p className="text-xs text-muted-foreground">가능 지원사 비율</p>
+              <p className="text-2xl font-bold">{matchingSummary.possibleRatio}%</p>
+              <p className="text-[11px] text-muted-foreground">{matchingSummary.possibleWorkerCount}명 가능</p>
+            </button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Dialog open={!!summaryModal} onOpenChange={(open) => !open && setSummaryModal(null)}>
+        <DialogContent className="max-w-4xl w-[95vw] max-h-[85vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>{summaryModal?.title || "대상자 상세 명단"}</DialogTitle>
+          </DialogHeader>
+          {summaryModal && (
+            <div className="overflow-x-auto">
+              {summaryModal.rows.length === 0 ? (
+                <p className="py-8 text-center text-sm text-muted-foreground">해당 조건에 해당하는 대상자가 없습니다.</p>
+              ) : (
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b text-left text-muted-foreground">
+                      <th className="py-2 pr-3">이름</th>
+                      <th className="py-2 pr-3">주요 날짜</th>
+                      <th className="py-2 pr-3">상태</th>
+                      <th className="py-2 pr-3">비고/사유</th>
+                      <th className="py-2 text-right">바로가기</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {summaryModal.rows.map((row) => (
+                      <tr key={row.id} className="border-b hover:bg-muted/40">
+                        <td className="py-2 pr-3 font-medium">{row.name}</td>
+                        <td className="py-2 pr-3 whitespace-nowrap">{row.date || "미등록"}</td>
+                        <td className="py-2 pr-3"><Badge variant={row.status.includes("대기") ? "secondary" : "default"}>{row.status}</Badge></td>
+                        <td className="py-2 pr-3 max-w-[360px] truncate">{row.note || "-"}</td>
+                        <td className="py-2 text-right"><Button size="sm" variant="outline" onClick={() => openSummaryTarget(row)}>보기</Button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+      <Card className="mb-6">
+        <CardHeader className="py-3">
+          <CardTitle className="text-sm">매칭 기준 안내</CardTitle>
+        </CardHeader>
+        <CardContent className="text-xs md:text-sm text-muted-foreground space-y-1 py-2">
+          <p>🔹 <strong>시간 적합도 (최대 40점)</strong>: 이용자 필요 요일/시간과 활동지원사 가능 요일/시간의 일치도</p>
+          <p>🔹 <strong>위치 근접도 (최대 30점)</strong>: 카카오맵 기반 주소 간 직선거리 (1km 이내 30점, 3km 25점, 5km 20점, 10km 10점)</p>
+          <p>🔹 <strong>선호도 반영 (최대 20점)</strong>: 이용자가 선호하는 활동지원사 특성 (성별, 운전, 경력 등) 반영</p>
+          <p>🔹 <strong>거부조건 필터</strong>: 활동지원사의 거부 성향(성인/남성/흡연자 등)과 이용자 환경 불일치 시 매칭에서 제외</p>
+        </CardContent>
+      </Card>
+
+      <Card className="mb-6 border-primary/20 bg-primary/[0.02]">
+        <CardHeader className="pb-3">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <CardTitle className="text-base">활동지원사 검색필터</CardTitle>
+              <p className="mt-1 text-xs text-muted-foreground">조건을 여러 개 선택하면 대기 중인 지원사 목록과 추천 결과가 즉시 좁혀집니다.</p>
+            </div>
+            <Button onClick={runMatching} disabled={!selectedUser} className="w-full sm:w-auto">
+              {selectedUser ? `${selectedUser.name} 추천매칭 실행` : "이용자를 먼저 선택하세요"}
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
+            <div>
+              <label htmlFor="worker-filter-search" className="mb-1 block text-xs font-medium text-muted-foreground">활동지원사 이름·연락처·지역</label>
+              <Input
+                id="worker-filter-search"
+                placeholder="검색어를 입력하세요"
+                value={manualSearch}
+                onChange={(e) => setManualSearch(e.target.value)}
+              />
+            </div>
+            <Button type="button" variant="outline" onClick={resetSearchFilters}>필터 초기화</Button>
+          </div>
+          <div className="flex flex-wrap gap-x-5 gap-y-2">
+            {["여성", "남성"].map((gender) => (
+              <div key={gender} className="flex items-center gap-2">
+                <Checkbox id={`gender-filter-${gender}`} checked={genderFilters.includes(gender)} onCheckedChange={(checked) => setGenderFilters((prev) => checked ? [...new Set([...prev, gender])] : prev.filter((item) => item !== gender))} />
+                <label htmlFor={`gender-filter-${gender}`} className="cursor-pointer text-sm">{gender}</label>
+              </div>
+            ))}
+            <div className="flex items-center gap-2">
+              <Checkbox id="filterForeigners" checked={filterForeigners} onCheckedChange={(checked) => setFilterForeigners(!!checked)} />
+              <label htmlFor="filterForeigners" className="cursor-pointer text-sm">외국인만</label>
+            </div>
+            <div className="flex items-center gap-2">
+              <Checkbox id="filterWeekend" checked={filterWeekend} onCheckedChange={(checked) => setFilterWeekend(!!checked)} />
+              <label htmlFor="filterWeekend" className="cursor-pointer text-sm">주말 가능</label>
+            </div>
+            <div className="flex items-center gap-2">
+              <Checkbox id="filterCanDrive" checked={filterCanDrive} onCheckedChange={(checked) => setFilterCanDrive(!!checked)} />
+              <label htmlFor="filterCanDrive" className="cursor-pointer text-sm">차량 운전 가능</label>
+            </div>
+            {SUPPORT_TYPES.map((type) => (
+              <div key={type} className="flex items-center gap-2">
+                <Checkbox id={`support-filter-${type}`} checked={supportFilters.includes(type)} onCheckedChange={() => toggleSupportFilter(type)} />
+                <label htmlFor={`support-filter-${type}`} className="cursor-pointer text-sm">{type}</label>
+              </div>
+            ))}
+          </div>
+          <div className="grid gap-3 rounded-md border bg-muted/20 p-3 md:grid-cols-2">
+            <div>
+              <div className="flex items-center justify-between"><span className="text-sm font-medium">나이 범위</span><Checkbox id="age-filter-active" checked={ageFilterActive} onCheckedChange={(checked) => setAgeFilterActive(!!checked)} /><label htmlFor="age-filter-active" className="text-xs">사용</label></div>
+              <div className="mt-2 flex items-center gap-2 text-xs"><input aria-label="최소 나이" type="range" min={20} max={70} value={ageRange[0]} disabled={!ageFilterActive} onChange={(event) => setAgeRange(([_, max]) => [Math.min(Number(event.target.value), max), max])} /><input aria-label="최대 나이" type="range" min={20} max={70} value={ageRange[1]} disabled={!ageFilterActive} onChange={(event) => setAgeRange(([min]) => [min, Math.max(Number(event.target.value), min)])} /><span>{ageRange[0]}~{ageRange[1]}세</span></div>
+            </div>
+            <div className="flex flex-wrap gap-x-4 gap-y-2">
+              {(["오전", "오후"] as WorkerTimeBand[]).map((band) => <div key={band} className="flex items-center gap-2"><Checkbox id={`time-filter-${band}`} checked={timeBandFilters.includes(band)} onCheckedChange={(checked) => setTimeBandFilters((prev) => checked ? [...new Set([...prev, band])] : prev.filter((item) => item !== band))} /><label htmlFor={`time-filter-${band}`} className="text-sm">{band} 가능</label></div>)}
+            </div>
+            <div className="flex flex-wrap gap-x-4 gap-y-2 md:col-span-2">
+              {[["diaper", "기저귀 지원 가능"], ["no-animal-allergy", "동물 알레르기 없음"], ["adults", "성인 이용자 지원"], ["male-users", "남성 이용자 지원"]].map(([key, label]) => <div key={key} className="flex items-center gap-2"><Checkbox id={`capability-filter-${key}`} checked={capabilityFilters.includes(key)} onCheckedChange={(checked) => setCapabilityFilters((prev) => checked ? [...new Set([...prev, key])] : prev.filter((item) => item !== key))} /><label htmlFor={`capability-filter-${key}`} className="text-sm">{label}</label></div>)}
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+            <Badge variant="outline">대기 이용자 {filteredUsers.length}명</Badge>
+            <Badge variant="outline">조건에 맞는 대기 지원사 {filteredWorkers.length}명</Badge>
+          </div>
+          {filteredWorkers.length === 0 && (
+            <p className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">현재 조건에 맞는 활동지원사가 없습니다. 필터를 바꾸거나 초기화해 주세요.</p>
+          )}
+        </CardContent>
+      </Card>
+
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
+        {/* 좌측: 매칭 대기 이용자 목록 */}
+        <div className="space-y-4">
+          <div className="sticky top-28 z-20 space-y-3 bg-background pb-2">
+            <div>
+              <h2 className="text-base font-semibold">매칭 대기중인 이용자 ({filteredUsers.length}명)</h2>
+              <p className="text-xs text-muted-foreground">카드를 선택하면 우측 지원사별 추천점수를 바로 비교할 수 있습니다.</p>
+            </div>
+            <Input
+              placeholder="이름 검색..."
+              value={nameSearch}
+              onChange={(e) => setNameSearch(e.target.value)}
+              className="w-full"
+            />
+          </div>
+          <div className="h-[560px] overflow-y-auto rounded-lg border bg-card p-2">
+            {filteredUsers.length === 0 ? (
+              <p className="p-4 text-center text-sm text-muted-foreground">검색된 이용자가 없습니다.</p>
+            ) : (
+              <div className="space-y-2">
+              {filteredUsers.map((u) => {
+                const requestTags = getUserRequestTags(u);
+                const cautionTags = getUserCautionTags(u);
+                return (
+                <button
+                  key={u.id}
+                  onClick={() => handleSelectUser(u.id)}
+                  className={`w-full rounded-lg border p-3 text-left transition hover:border-primary/50 hover:bg-muted/30 ${selectedUserId === u.id ? "border-primary bg-primary/5 ring-1 ring-primary/20" : ""}`}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <span className="font-bold">{u.name}</span>
+                      <p className="mt-0.5 text-xs text-muted-foreground">{u.age || "나이 미등록"}세 · {u.gender || "성별 미등록"} · {[u.disabilityDegree, u.disabilityType, u.secondaryDisabilityType].filter(Boolean).join(" / ") || "장애정보 미등록"}</p>
+                    </div>
+                    <Badge className="bg-orange-500 text-white hover:bg-orange-500">대기중</Badge>
+                  </div>
+                  <div className="mt-3 grid gap-2 rounded-md bg-muted/40 p-2 text-xs">
+                    <p><strong>바우처:</strong> {formatUserVoucherHours(u)} · {formatVoucherTier(u)}</p>
+                    <p><strong>요청 필요시간:</strong> {formatUserMatchingTime(u)}</p>
+                    <p className="font-medium text-primary">{formatRequiredVoucherGap(u)}</p>
+                  </div>
+                  <div className="mt-2">
+                    <p className="text-[11px] font-semibold text-muted-foreground">요청사항</p>
+                    <div className="mt-1 flex flex-wrap gap-1">{requestTags.length ? requestTags.map((tag) => <Badge key={tag} variant="secondary" className="text-[10px]">{tag}</Badge>) : <span className="text-xs text-muted-foreground">등록 없음</span>}</div>
+                  </div>
+                  <div className="mt-2">
+                    <p className="text-[11px] font-semibold text-red-600">확인·주의사항</p>
+                    <div className="mt-1 flex flex-wrap gap-1">{cautionTags.length ? cautionTags.map((tag) => <Badge key={tag} variant="outline" className="border-red-200 bg-red-50 text-[10px] text-red-700">{tag}</Badge>) : <span className="text-xs text-muted-foreground">등록 없음</span>}</div>
+                  </div>
+                  <p className="mt-2 truncate text-[11px] text-muted-foreground">📍 {u.address || "주소 미등록"}</p>
+                </button>
+                );
+              })}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* 우측: 매칭 대기 활동지원사 목록 + 추천 결과 */}
+        <div className="space-y-6">
+          <div className="space-y-4">
+            <div className="sticky top-28 z-20 space-y-3 bg-background pb-2">
+              <div>
+                <h2 className="text-base font-semibold">매칭 대기중인 활동지원사 ({visibleWorkers.length}명)</h2>
+                <p className="text-xs text-muted-foreground">퇴사자는 자동 제외되며, 카드를 누르면 선택 이용자와의 적합도를 확인할 수 있습니다.</p>
+              </div>
+              <Input placeholder="지원사 이름·연락처·주소 검색..." value={manualSearch} onChange={(event) => setManualSearch(event.target.value)} />
+            </div>
+            <div className="h-[560px] space-y-2 overflow-y-auto rounded-lg border bg-card p-2">
+              {visibleWorkers.length === 0 ? (
+                <p className="p-6 text-center text-sm text-muted-foreground">조건에 맞는 대기 활동지원사가 없습니다.</p>
+              ) : visibleWorkers.map((worker) => {
+                const score = scoreByWorkerId.get(worker.id);
+                const rank = recommendedRankByWorkerId.get(worker.id);
+                const availableTags = getWorkerAvailableTags(worker);
+                const unavailableTags = getWorkerUnavailableTags(worker);
+                return (
+                  <div key={worker.id} className={`rounded-lg border p-3 transition hover:border-primary/50 ${manualWorkerId === worker.id ? "border-primary bg-primary/5 ring-1 ring-primary/20" : ""}`}>
+                    <button type="button" className="w-full text-left" onClick={() => setManualWorkerId(worker.id || "")}>
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-bold">{worker.name}</span>
+                            {rank && <Badge className="bg-primary text-primary-foreground">추천 {rank}순위</Badge>}
+                          </div>
+                          <p className="mt-0.5 text-xs text-muted-foreground">{worker.age || "나이 미등록"}세 · {worker.gender || "성별 미등록"} · {worker.address || worker.residenceArea || "주소 미등록"}</p>
+                        </div>
+                        {score && <span className="whitespace-nowrap text-sm font-bold text-primary">{score.score.toFixed(0)}점</span>}
+                      </div>
+                      <div className="mt-3 rounded-md bg-muted/40 p-2 text-xs">
+                        <p><strong>활동가능시간:</strong> {formatWorkerMatchingTime(worker)}</p>
+                        {worker.preferredArea && <p className="mt-1"><strong>희망지역:</strong> {worker.preferredArea}</p>}
+                      </div>
+                      <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                        <div>
+                          <p className="text-[11px] font-semibold text-emerald-700">업무가능 사항</p>
+                          <div className="mt-1 flex flex-wrap gap-1">{availableTags.length ? availableTags.map((tag) => <Badge key={tag} className="bg-emerald-600 text-[10px] text-white hover:bg-emerald-600">{tag}</Badge>) : <span className="text-xs text-muted-foreground">등록 없음</span>}</div>
+                        </div>
+                        <div>
+                          <p className="text-[11px] font-semibold text-red-600">불가능한 사항</p>
+                          <div className="mt-1 flex flex-wrap gap-1">{unavailableTags.length ? unavailableTags.map((tag) => <Badge key={tag} variant="outline" className="border-red-200 bg-red-50 text-[10px] text-red-700">{tag}</Badge>) : <span className="text-xs text-muted-foreground">등록 없음</span>}</div>
+                        </div>
+                      </div>
+                      <p className="mt-2 line-clamp-2 text-[11px] text-muted-foreground"><strong>특이사항:</strong> {worker.notes || "등록 없음"}</p>
+                      {score && <Progress value={(score.score / 90) * 100} className="mt-2 h-2" />}
+                    </button>
+                    <div className="mt-3 flex flex-wrap justify-end gap-2">
+                      {selectedUser && score && <Button size="sm" variant="outline" onClick={() => openFailureDialog(worker, score.score)}>매칭 실패 기록</Button>}
+                      <Button size="sm" variant="outline" onClick={() => openWorkerDetail(worker)}>지원사 상세보기</Button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {!selectedUser ? (
+            /* 이용자 미선택 시: 전역 추천 매칭 1~3순위 */
+            globalTopMatches.length > 0 ? (
+              <div className="space-y-4">
+                <h2 className="text-lg font-bold">✨ 추천 매칭 대기 이용자 (상위 3)</h2>
+                {globalTopMatches.map(({ user: u, top3 }, userIdx) => (
+                  <Card key={u.id} className="cursor-pointer hover:border-primary/50 transition-all" onClick={() => handleSelectUser(u.id)}>
+                    <CardHeader className="pb-2">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <span className="text-lg font-bold text-primary">{userIdx + 1}순위</span>
+                          <span className="font-semibold">{u.name}</span>
+                          <span className="text-xs text-muted-foreground">
+                            {u.gender} · {u.age}세 · {u.disabilityType}
+                          </span>
+                        </div>
+                        <span className="text-xs text-muted-foreground">클릭하여 상세 보기 →</span>
+                      </div>
+                    </CardHeader>
+                    <CardContent className="space-y-3">
+                      <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+                        <span>📍 {u.address?.split(' ').slice(0, 2).join(' ') || "주소미정"}</span>
+                        <span>지원유형: {u.supportTypes?.join(", ") || "미입력"}</span>
+                      </div>
+                      <div className="space-y-2">
+                        {top3.map((r, i) => (
+                          <div key={r.worker.id} className="flex items-center justify-between p-3 bg-muted/50 rounded-lg">
+                            <div className="flex items-center gap-3">
+                              <span className="text-sm font-bold text-primary">{i + 1}위</span>
+                              <div>
+                                <span className="font-medium text-sm">{r.worker.name}</span>
+                                <span className="text-xs text-muted-foreground ml-2">
+                                  {r.worker.gender} · {r.worker.experience}
+                                </span>
+                              </div>
+                              <div className="flex flex-wrap gap-1">{getWorkerStatusBadges(r.worker).map((badge) => <Badge key={badge.label} className={`${badge.className} text-[10px]`}>{badge.label}</Badge>)}</div>
+                            </div>
+                            <div className="flex items-center gap-3">
+                              <Progress value={(r.score / 90) * 100} className="w-24 h-2" />
+                              <span className="text-sm font-bold text-primary">{r.score.toFixed(0)}점</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            ) : (
+              <Card className="h-[300px] flex items-center justify-center p-8 text-center text-muted-foreground">
+                <div>
+                  <p className="text-lg font-medium mb-1">🔍 매칭 가능한 대기 이용자가 없습니다</p>
+                  <p className="text-sm">필터 조건을 변경하거나 대기 이용자를 등록해 주세요.</p>
+                </div>
+              </Card>
+            )
+          ) : (
+            /* 이용자 선택 시: 상세 정보 + 상담이력 + 매칭결과 */
+            <div className="space-y-6">
+              <Card>
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <CardTitle className="text-base font-bold">🎯 {selectedUser.name} 이용자 정보</CardTitle>
+                  <div className="flex flex-wrap justify-end gap-2">
+                    <Button variant="outline" onClick={() => navigate(`/users?detailId=${encodeURIComponent(selectedUser.id || "")}`)}>이용자 상세보기</Button>
+                    <Button onClick={runMatching} className="h-9">🔍 매칭 실행</Button>
+                  </div>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  <div className="grid grid-cols-2 md:grid-cols-3 gap-3 text-sm border-t pt-3">
+                    <span><strong>성별/나이:</strong> {selectedUser.gender} / {selectedUser.age}세</span>
+                    <span><strong>장애유형:</strong> {selectedUser.disabilityType}</span>
+                    <span><strong>바우처:</strong> {formatVoucherTier(selectedUser)} ({formatUserVoucherHours(selectedUser)})</span>
+                    <span><strong>필요요일:</strong> {selectedUser.requiredDays}</span>
+                    <span className="col-span-2"><strong>필요시간:</strong> {formatUserMatchingTime(selectedUser)}</span>
+                    <span><strong>가족구성:</strong> {selectedUser.familyMembers || "정보없음"}</span>
+                    <span><strong>지원유형:</strong> {selectedUser.supportTypes?.join(", ") || "정보없음"}</span>
+                    <span className="col-span-2"><strong>환경:</strong> {selectedUser.environmentTags?.join(", ") || "없음"}</span>
+                    <span className="col-span-2"><strong>선호 특성:</strong> {selectedUser.preferredWorkerTraits || "없음"}</span>
+                    <span className="col-span-2 md:col-span-3"><strong>주소:</strong> {selectedUser.address}</span>
+                    <span className="col-span-2 md:col-span-3 font-medium text-primary">{formatRequiredVoucherGap(selectedUser)}</span>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader className="py-2 border-b">
+                  <CardTitle className="text-sm font-semibold">📝 상담 이력 ({selectedUserRecords.length}건)</CardTitle>
+                </CardHeader>
+                <CardContent className="p-0">
+                  <div className="max-h-[220px] overflow-y-auto divide-y">
+                    {selectedUserRecords.length === 0 ? (
+                      <p className="p-4 text-center text-xs text-muted-foreground">기록된 상담 이력이 없습니다.</p>
+                    ) : (
+                      selectedUserRecords.map((r) => (
+                        <div key={r.id} className="p-3 text-xs hover:bg-muted/10">
+                          <div className="flex justify-between items-center mb-1">
+                            <div className="flex items-center gap-1.5">
+                              <Badge variant="outline" className="text-[10px] py-0">{r.category}</Badge>
+                              <span className="font-semibold text-foreground">{r.counselorName || "미입력"} 상담사</span>
+                            </div>
+                            <span className="text-[10px] text-muted-foreground">{r.date}</span>
+                          </div>
+                          <p className="text-muted-foreground whitespace-pre-wrap">{r.content}</p>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader className="py-2 border-b">
+                  <CardTitle className="text-sm font-semibold">🖐 수동 매칭 (활동지원사 직접 선택)</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-3 pt-3">
+                  <Input
+                    placeholder="활동지원사 이름 검색..."
+                    value={manualSearch}
+                    onChange={(e) => setManualSearch(e.target.value)}
+                  />
+                  <div className="max-h-[220px] overflow-y-auto border rounded-md divide-y">
+                    {manualCandidates.length === 0 ? (
+                      <p className="p-4 text-center text-xs text-muted-foreground">조건에 맞는 활동지원사가 없습니다.</p>
+                    ) : (
+                      manualCandidates.map((r) => (
+                        <button
+                          key={r.worker.id}
+                          onClick={() => setManualWorkerId(r.worker.id)}
+                          className={`w-full text-left p-2.5 text-xs hover:bg-muted/40 flex items-center justify-between gap-2 ${manualWorkerId === r.worker.id ? "bg-primary/5 border-l-4 border-primary" : ""}`}
+                        >
+                          <span className="flex items-center gap-2">
+                            <span className="font-semibold text-sm">{r.worker.name}</span>
+                            <span className="text-muted-foreground">
+                              {r.worker.gender} · {r.worker.experience} · {r.worker.preferredArea || "지역미정"}
+                            </span>
+                          </span>
+                          <span className="font-bold text-primary">{r.score.toFixed(0)}점</span>
+                        </button>
+                      ))
+                    )}
+                  </div>
+                  {manualSelected && (
+                    <div className="border rounded-lg p-3 space-y-2 bg-muted/30">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-semibold">
+                          {manualSelected.worker.name} · {manualSelected.worker.contractStatus}
+                        </span>
+                        <span className="text-sm font-bold text-primary">
+                          {manualSelected.score.toFixed(0)}<span className="text-xs text-muted-foreground">/90점</span>
+                        </span>
+                      </div>
+                      <Progress value={(manualSelected.score / 90) * 100} className="h-2" />
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+                        <div className="bg-card rounded p-1.5">
+                          <p className="text-muted-foreground">시간 적합도</p>
+                          <p className="font-semibold">{manualSelected.details.timeScore.toFixed(1)} / 40</p>
+                        </div>
+                        <div className="bg-card rounded p-1.5">
+                          <p className="text-muted-foreground">위치 근접도</p>
+                          <p className="font-semibold">{manualSelected.details.locationScore.toFixed(1)} / 30</p>
+                          {manualSelected.details.distanceKm !== null && (
+                            <p className="text-[10px] text-muted-foreground">{manualSelected.details.distanceKm.toFixed(1)}km</p>
+                          )}
+                        </div>
+                        <div className="bg-card rounded p-1.5">
+                          <p className="text-muted-foreground">선호도 반영</p>
+                          <p className="font-semibold">{manualSelected.details.preferenceScore.toFixed(1)} / 20</p>
+                        </div>
+                        <div className="bg-card rounded p-1.5">
+                          <p className="text-muted-foreground">거부패널티</p>
+                          <p className="font-semibold">{manualSelected.details.rejectionPenalty.toFixed(0)}</p>
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p className="text-[11px] text-muted-foreground">
+                          📍 {manualSelected.worker.address || "주소 미입력"} · 가능요일 {manualSelected.worker.availableDays || "미입력"}
+                        </p>
+                        {getPairRejectionScore(selectedUser, manualSelected.worker) > 0 && (
+                          <Badge variant="destructive">거부점수 {getPairRejectionScore(selectedUser, manualSelected.worker)}점</Badge>
+                        )}
+                        <Button size="sm" variant="outline" onClick={() => openFailureDialog(manualSelected.worker, manualSelected.score)}>
+                          매칭 실패 기록
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <div>
+                <h3 className="font-bold text-base text-foreground mb-3">💡 매칭 추천 결과 (상위 3) ({displayedResults.length}명)</h3>
+                {displayedResults.length > 0 ? (
+                  <div className="space-y-3">
+                    {displayedResults.map((r, i) => (
+                      <Card key={r.worker.id} className="card-hover" onClick={() => openWorkerDetail(r.worker)}>
+                        <CardContent className="p-4">
+                          <div className="flex items-center justify-between mb-3">
+                            <div className="flex items-center gap-3">
+                              <span className="text-base md:text-lg font-bold text-primary">{i + 1}위</span>
+                              <div>
+                                <span className="font-semibold text-sm md:text-base">{r.worker.name}</span>
+                                <span className="text-xs text-muted-foreground ml-2">
+                                  {r.worker.gender} · {r.worker.experience} · {r.worker.preferredArea}
+                                </span>
+                              </div>
+                              <div className="flex flex-wrap gap-1">{getWorkerStatusBadges(r.worker).map((badge) => <Badge key={badge.label} className={`${badge.className} text-[10px]`}>{badge.label}</Badge>)}</div>
+                            </div>
+                            <div className="text-right">
+                              <span className="text-lg font-bold text-primary">{r.score.toFixed(0)}</span>
+                              <span className="text-xs text-muted-foreground">/90점</span>
+                            </div>
+                          </div>
+                          <Progress value={(r.score / 90) * 100} className="mb-3 h-2" />
+                          {getPairRejectionScore(selectedUser, r.worker) > 0 && (
+                            <Badge variant="destructive" className="mb-2">실패/거부점수 {getPairRejectionScore(selectedUser, r.worker)}점 주의</Badge>
+                          )}
+                          <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+                            <div className="bg-muted rounded p-1.5">
+                              <p className="text-muted-foreground">시간 적합도</p>
+                              <p className="font-semibold">{r.details.timeScore.toFixed(1)} / 40</p>
+                            </div>
+                            <div className="bg-muted rounded p-1.5">
+                              <p className="text-muted-foreground">위치 근접도</p>
+                              <p className="font-semibold">{r.details.locationScore.toFixed(1)} / 30</p>
+                              {r.details.distanceKm !== null && (
+                                <p className="text-[10px] text-muted-foreground">{r.details.distanceKm.toFixed(1)}km</p>
+                              )}
+                            </div>
+                            <div className="bg-muted rounded p-1.5">
+                              <p className="text-muted-foreground">선호도 반영</p>
+                              <p className="font-semibold">{r.details.preferenceScore.toFixed(1)} / 20</p>
+                            </div>
+                            <div className="bg-muted rounded p-1.5">
+                              <p className="text-muted-foreground">거부패널티</p>
+                              <p className="font-semibold">{r.details.rejectionPenalty.toFixed(0)}</p>
+                            </div>
+                          </div>
+                          <div className="mt-3 flex justify-end">
+                            <Button size="sm" variant="outline" onClick={(e) => { e.stopPropagation(); openFailureDialog(r.worker, r.score); }}>
+                              매칭 실패 기록
+                            </Button>
+                          </div>
+                        </CardContent>
+                      </Card>
+                    ))}
+                  </div>
+                ) : (
+                  <Card>
+                    <CardContent className="p-8 text-center text-sm text-muted-foreground">매칭 실행 버튼을 눌러 결과 추천을 받으세요.</CardContent>
+                  </Card>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+      <Dialog open={!!failureDialog} onOpenChange={(open) => !open && setFailureDialog(null)}>
+        <DialogContent className="max-w-lg w-[95vw]" onPointerDownOutside={(event) => event.preventDefault()}>
+          <DialogHeader>
+            <DialogTitle>매칭 실패 기록</DialogTitle>
+          </DialogHeader>
+          {failureDialog && (
+            <div className="space-y-4">
+              <div className="rounded-md border bg-muted/30 p-3 text-sm">
+                <p className="font-semibold">{failureDialog.user.name} - {failureDialog.worker.name}</p>
+                <p className="text-muted-foreground">현재 추천점수 {failureDialog.score.toFixed(0)}점 · 저장 시 거부점수 {FAILURE_SCORE_DELTA}점 추가</p>
+              </div>
+              <div>
+                <label className="text-sm font-medium">실패 사유</label>
+                <Select value={failureReason} onValueChange={setFailureReason}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {FAILURE_REASONS.map((reason) => <SelectItem key={reason} value={reason}>{reason}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div>
+                <label className="text-sm font-medium">상세 사유</label>
+                <Textarea value={failureDetail} onChange={(e) => setFailureDetail(e.target.value)} placeholder="필요 시 구체적인 거절/불일치 내용을 입력하세요." />
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" onClick={() => setFailureDialog(null)}>취소</Button>
+                <Button onClick={saveMatchingFailure}>저장</Button>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+};
+
+export default Matching;

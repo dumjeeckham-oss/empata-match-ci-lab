@@ -1,0 +1,35 @@
+/**
+ * Firestore 컬렉션 이름을 프로젝트 전체에서 단일 소스로 관리합니다.
+ * (단수형 user/worker 오타로 인해 저장/조회가 분리되는 사고를 방지)
+ */
+export const USERS_COLLECTION = "users" as const;
+export const WORKERS_COLLECTION = "workers" as const;
+export const EVENT_FORM_COLLECTIONS = {
+  forms: "eventForms", slots: "eventFormSlots", rounds: "eventFormRounds",
+  versions: "eventFormVersions", submissions: "eventFormSubmissions",
+  images: "eventFormImageBlobs", public: "eventFormPublic",
+  receipts: "eventFormExportReceipts", resetJobs: "eventFormResetJobs", audit: "eventFormAuditLogs",
+} as const;
+export const TERMINATIONS_COLLECTION = "terminations" as const;
+export const HANDOVERS_COLLECTION = "handovers" as const;
+export const MATCHING_HISTORY_COLLECTION = "matchingHistory" as const;
+export const COUNSELING_COLLECTION = "counseling" as const;
+/** 전사 완료 후 삭제하는 전달용 임시자료. 상담기록·이력으로 보존하지 않는다. */
+export const COUNSELING_HANDWRITING_COLLECTION = "counselingHandwritingMemos" as const;
+export const REGISTRATION_HANDWRITING_COLLECTION = "registrationHandwritingMemos" as const;
+export const WORK_TODOS_COLLECTION = "workTodos" as const;
+export const MATCHING_BOARD_COLLECTION = "matchingBoard" as const;
+export const ANNUAL_SCHEDULES_COLLECTION = "annualSchedules" as const;
+export const WORK_CALENDAR_EVENTS_COLLECTION = "workCalendarEvents" as const;
+export const WORK_QUICK_LINKS_COLLECTION = "workQuickLinks" as const;
+export const SALARY_CHANGES_COLLECTION = "salaryChangeDocuments" as const;
+
+/** 로그인 UID별 하위 컬렉션으로 업무보드 배치를 완전히 분리합니다. */
+export const getWorkBoardPreferencesCollection = (uid: string) => `userPreferences/${uid}/workBoard` as const;
+
+export type CoreCollectionName =
+  | typeof USERS_COLLECTION
+  | typeof WORKERS_COLLECTION
+  | typeof TERMINATIONS_COLLECTION
+  | typeof HANDOVERS_COLLECTION
+  | typeof MATCHING_HISTORY_COLLECTION;

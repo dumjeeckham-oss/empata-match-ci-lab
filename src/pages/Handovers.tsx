@@ -1,0 +1,798 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { useCollection } from "@/hooks/useFirestore";
+import { isWorkerRetired } from "@/lib/statusLifecycle";
+import { type ServiceUser, type Worker, type HandoverDocument, type MatchingHistoryRecord, VOUCHER_HOURS } from "@/types";
+import { HANDOVERS_COLLECTION, USERS_COLLECTION, WORKERS_COLLECTION, MATCHING_HISTORY_COLLECTION } from "@/lib/collectionNames";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { SpellCheckButton } from "@/components/SpellCheckButton";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { toast } from "@/hooks/use-toast";
+import { Timestamp } from "@/lib/firebase";
+import { syncUserToWorkers } from "@/lib/assignments";
+import { buildHandoverDocumentHistory, findExistingMatchForHandover } from "@/lib/handoverHistory";
+import dongbaekLogo from "@/assets/dongbaek-logo.png";
+import { formatVoucherTier } from "@/lib/userVoucher";
+import { formatScheduleSummary } from "@/lib/workBoard";
+
+import { Printer, Search, X, Edit2, Trash2 } from "lucide-react";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+
+function safeMsg(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  return String(e);
+}
+
+function normalizePhone(phone: string): string {
+  return (phone || "").replace(/\D/g, "");
+}
+
+const STAFF_NAMES = ["김광민", "최혜양", "김세미", "조미경"];
+
+function labelWithLast4(name: string, phone: string): string {
+  const last4 = normalizePhone(phone).slice(-4);
+  return last4 ? `${name}(${last4})` : name;
+}
+
+export default function Handovers() {
+  const { data: usersRaw, update: updateUser } = useCollection<ServiceUser>(USERS_COLLECTION);
+  const { data: workersRaw, update: updateWorker } = useCollection<Worker>(WORKERS_COLLECTION);
+  const { data: docsRaw, add: addHandover, update: updateHandover, remove: removeHandover, loading } = useCollection<HandoverDocument>(HANDOVERS_COLLECTION);
+  const users = usersRaw || [];
+  const workers = workersRaw || [];
+  const docs = docsRaw || [];
+  const {
+    data: matchingHistoryRaw,
+    add: addMatchingHistory,
+    update: updateMatchingHistory,
+  } = useCollection<MatchingHistoryRecord>(MATCHING_HISTORY_COLLECTION);
+  const matchingLogs = matchingHistoryRaw || [];
+  const [searchParams] = useSearchParams();
+
+
+
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string>("");
+  const [isUserSearchOpen, setIsUserSearchOpen] = useState(false);
+  const [nextWorkerId, setNextWorkerId] = useState<string>("");
+  const [isWorkerSearchOpen, setIsWorkerSearchOpen] = useState(false);
+  const [selectedPrevWorkerId, setSelectedPrevWorkerId] = useState<string>("");
+  const [isPrevWorkerSearchOpen, setIsPrevWorkerSearchOpen] = useState(false);
+  
+  const [handoverPersonName, setHandoverPersonName] = useState<string>("");
+  const [handoverDate, setHandoverDate] = useState<string>(new Date().toISOString().slice(0, 10));
+  const [takeoverPersonName, setTakeoverPersonName] = useState<string>("");
+  const [takeoverDate, setTakeoverDate] = useState<string>(new Date().toISOString().slice(0, 10));
+  const [reason, setReason] = useState<string>("");
+  const [handoverTasks, setHandoverTasks] = useState<string>(""); // New field for handover tasks
+  const [notes, setNotes] = useState<string>("");
+  const [printDoc, setPrintDoc] = useState<HandoverDocument | null>(null);
+
+  const selectedUser = useMemo(() => users.find((u) => u.id === userId), [users, userId]);
+  const nextWorker = useMemo(() => workers.find((w) => w.id === nextWorkerId), [workers, nextWorkerId]);
+
+  const requestedOldWorkerId = searchParams.get("oldWorkerId") || "";
+  const prevWorkerId = selectedPrevWorkerId || requestedOldWorkerId || selectedUser?.assignedHelperIds?.[0] || selectedUser?.assigned_workers?.[0] || "";
+  const prevWorker = useMemo(() => {
+    if (!selectedUser) return undefined;
+    if (prevWorkerId) {
+      const byId = workers.find((w) => w.id === prevWorkerId);
+      if (byId) return byId;
+    }
+    const name = (selectedUser.assignedHelperNames?.[0] || "").trim();
+    const phone = normalizePhone(selectedUser.assignedHelperPhones?.[0] || "");
+    if (!name && !phone) return undefined;
+    return workers.find((w) => {
+      const wName = String(w?.name || "").trim();
+      const wPhone = normalizePhone(w?.phone || "");
+      if (name && phone) return wName === name && wPhone === phone;
+      if (phone) return wPhone === phone;
+      return wName === name;
+    });
+  }, [selectedUser, workers, prevWorkerId]);
+
+  useEffect(() => {
+    if (!editingId) {
+      if (prevWorker?.name) {
+        setHandoverPersonName(prevWorker.name);
+      } else {
+        const fallbackName = (selectedUser?.assignedHelperNames?.[0] || "").trim();
+        if (fallbackName) setHandoverPersonName(fallbackName);
+      }
+    }
+  }, [selectedUser, prevWorker, editingId]);
+
+  // 이용자/활동지원사 관리에서 담당자 교체 시 넘어온 값으로 자동 채움
+  useEffect(() => {
+    const qUserId = searchParams.get("userId") || "";
+    const qNextWorkerId = searchParams.get("nextWorkerId") || "";
+    const qEndDate = searchParams.get("endDate") || "";
+    if (qUserId) setUserId(qUserId);
+    if (requestedOldWorkerId) setSelectedPrevWorkerId(requestedOldWorkerId);
+    if (qNextWorkerId) setNextWorkerId(qNextWorkerId);
+    if (qEndDate) setHandoverDate(qEndDate);
+    if (qUserId && !reason) setReason("담당 활동지원사 변경");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+
+  // 담당 변경 내역을 매칭 히스토리에 자동 기록 (전임 해제 + 후임 매칭)
+  const recordHandoverHistory = async (
+    user: ServiceUser & { id?: string },
+    fromWorker: (Worker & { id?: string }) | undefined,
+    toWorker: Worker & { id?: string }
+  ) => {
+    try {
+      const note = `인계·인수서 작성 (${fromWorker?.name || "미배정"} → ${toWorker.name}) / 사유: ${reason.trim() || "-"}`;
+      if (fromWorker?.id && fromWorker.id !== toWorker.id) {
+        const releaseRecord: Omit<MatchingHistoryRecord, "id"> = {
+          type: "해제",
+          userId: user.id!,
+          userName: user.name,
+          userPhone: user.phone,
+          workerId: fromWorker.id,
+          workerName: fromWorker.name,
+          workerPhone: fromWorker.phone,
+          date: user.matchingHistory?.find((entry) => entry.workerId === fromWorker.id)?.serviceStartDate || user.serviceStartDate || handoverDate,
+          endDate: handoverDate,
+          serviceSchedule: fromWorker?.id ? user.assignmentSchedules?.[fromWorker.id] : undefined,
+          notes: note,
+        };
+        const existingRelease = matchingLogs.find((record) =>
+          record.userId === releaseRecord.userId &&
+          record.workerId === releaseRecord.workerId &&
+          record.type === "해제" &&
+          record.endDate === releaseRecord.endDate,
+        );
+        if (existingRelease?.id) await updateMatchingHistory(existingRelease.id, releaseRecord);
+        else await addMatchingHistory(releaseRecord);
+      }
+      const matchingRecord: Omit<MatchingHistoryRecord, "id"> = {
+        type: "매칭",
+        userId: user.id!,
+        userName: user.name,
+        userPhone: user.phone,
+        workerId: toWorker.id!,
+        workerName: toWorker.name,
+        workerPhone: toWorker.phone,
+        date: takeoverDate,
+        serviceSchedule: (fromWorker?.id ? user.assignmentSchedules?.[fromWorker.id] : undefined) || user.weeklySchedule || [],
+        notes: note,
+      };
+      const existingMatch = findExistingMatchForHandover(matchingLogs, user.id!, toWorker.id!);
+      if (existingMatch?.id) {
+        await updateMatchingHistory(existingMatch.id, {
+          ...matchingRecord,
+          date: existingMatch.date || matchingRecord.date,
+        });
+      } else {
+        await addMatchingHistory(matchingRecord);
+      }
+    } catch (e) {
+      console.error("매칭 히스토리 기록 실패:", e);
+    }
+  };
+
+
+  const handleSave = async () => {
+    try {
+      if (!selectedUser?.id) {
+        alert("❌ 저장 불가: 이용자(수급자)를 선택해주세요.");
+        return;
+      }
+      if (!handoverPersonName.trim() || !handoverDate) {
+        alert("❌ 저장 불가: 인계자 성명/인계일은 필수입니다.");
+        return;
+      }
+      if (!takeoverPersonName.trim() || !takeoverDate) {
+        alert("❌ 저장 불가: 인수자 성명/인수일은 필수입니다.");
+        return;
+      }
+      if (!reason.trim()) {
+        alert("❌ 저장 불가: 인계 사유는 필수입니다.");
+        return;
+      }
+      if (!nextWorker?.id) {
+        alert("❌ 저장 불가: 후임 활동지원사를 선택해주세요.");
+        return;
+      }
+
+      const transferredSchedule = (prevWorker?.id ? selectedUser.assignmentSchedules?.[prevWorker.id] : undefined) || selectedUser.weeklySchedule || [];
+
+      const updatedDocumentHistory = buildHandoverDocumentHistory({
+        entries: selectedUser.matchingHistory,
+        previousWorkerId: prevWorker?.id,
+        nextWorker: { id: nextWorker.id, name: nextWorker.name, phone: nextWorker.phone },
+        handoverDate,
+        takeoverDate,
+        reasonDetail: reason.trim(),
+        serviceSchedule: transferredSchedule,
+      });
+
+      const payload: Omit<HandoverDocument, "id"> = {
+        userId: selectedUser.id!,
+        userName: selectedUser.name,
+        userPhone: selectedUser.phone,
+        userAddress: selectedUser.address,
+        voucherTier: selectedUser.voucherTier,
+        voucherTierLabel: selectedUser.voucherTierLabel || "",
+        disabilityType: selectedUser.disabilityType,
+        reason: reason.trim(),
+        handoverPersonName: handoverPersonName.trim(),
+        handoverDate,
+        takeoverPersonName: takeoverPersonName.trim(),
+        takeoverDate,
+        prevWorkerId: prevWorker?.id,
+        prevWorkerName: prevWorker?.name,
+        prevWorkerPhone: prevWorker?.phone,
+        nextWorkerId: nextWorker.id!,
+        nextWorkerName: nextWorker.name,
+        nextWorkerPhone: nextWorker.phone,
+        notes: notes.trim(),
+        handoverTasks: handoverTasks.trim(),
+        updatedAt: Timestamp.now(),
+      };
+
+      if (editingId) {
+        // 기존 인계·인수서 수정
+        await updateHandover(editingId, payload);
+        // 데이터 동기화 로직 (수정 시에도 담당 활동지원사 변경 반영)
+        const prevHelperIds = selectedUser.assignedHelperIds ?? [];
+        const newHelperIds = [nextWorker.id!];
+        const updatedUserEdit: Partial<ServiceUser> = {
+          assignedHelperIds: newHelperIds,
+          assigned_workers: newHelperIds,
+          assignedHelperNames: [nextWorker.name],
+          assignedHelperPhones: [nextWorker.phone],
+          matchingHistory: updatedDocumentHistory,
+          assignmentSchedules: { [nextWorker.id!]: transferredSchedule },
+          contractStatus: "서비스중",
+          resignationDate: "",
+        };
+        await updateUser(selectedUser.id!, updatedUserEdit as any);
+        await syncUserToWorkers(
+          selectedUser.id!,
+          { name: selectedUser.name, phone: selectedUser.phone, assignedHelperIds: newHelperIds },
+          workers as any,
+          prevHelperIds,
+          updateWorker as any
+        );
+        if (prevWorker?.id && prevWorker.id !== nextWorker.id) {
+          const remainingIds = (prevWorker.assignedUserIds || []).filter((id) => id !== selectedUser.id);
+          await updateWorker(prevWorker.id, {
+            contractStatus: remainingIds.length > 0 ? "근무중" : "대기",
+            waitingForMatch: remainingIds.length === 0,
+            serviceEndDate: remainingIds.length === 0 ? handoverDate : null,
+          });
+        }
+        await updateWorker(nextWorker.id, {
+          contractStatus: "근무중",
+          waitingForMatch: false,
+          serviceEndDate: null,
+          retirementDate: "",
+          resignationDate: "",
+        });
+        await recordHandoverHistory(selectedUser, prevWorker, nextWorker);
+        toast({ title: "업무 인계·인수서 수정 완료" });
+
+      } else {
+        (payload as any).createdAt = Timestamp.now();
+        await addHandover(payload as any);
+        
+        // Update user assignment on edit as well
+        const prevHelperIds = selectedUser.assignedHelperIds ?? [];
+        const newHelperIds = [nextWorker.id!];
+        const updatedUser: Partial<ServiceUser> = {
+          assignedHelperIds: newHelperIds,
+          assigned_workers: newHelperIds,
+          assignedHelperNames: [nextWorker.name],
+          assignedHelperPhones: [nextWorker.phone],
+          matchingHistory: updatedDocumentHistory,
+          assignmentSchedules: { [nextWorker.id!]: transferredSchedule },
+          contractStatus: "서비스중",
+          resignationDate: "",
+        };
+        await updateUser(selectedUser.id!, updatedUser as any);
+        await syncUserToWorkers(
+          selectedUser.id!,
+          { name: selectedUser.name, phone: selectedUser.phone, assignedHelperIds: newHelperIds },
+          workers as any,
+          prevHelperIds,
+          updateWorker as any
+        );
+        if (prevWorker?.id && prevWorker.id !== nextWorker.id) {
+          const remainingIds = (prevWorker.assignedUserIds || []).filter((id) => id !== selectedUser.id);
+          await updateWorker(prevWorker.id, {
+            contractStatus: remainingIds.length > 0 ? "근무중" : "대기",
+            waitingForMatch: remainingIds.length === 0,
+            serviceEndDate: remainingIds.length === 0 ? handoverDate : null,
+          });
+        }
+        await updateWorker(nextWorker.id, {
+          contractStatus: "근무중",
+          waitingForMatch: false,
+          serviceEndDate: null,
+          retirementDate: "",
+          resignationDate: "",
+        });
+        await recordHandoverHistory(selectedUser, prevWorker, nextWorker);
+
+
+
+        toast({
+          title: "업무 인계·인수서 저장 완료",
+          description: `담당 활동지원사가 ${prevWorker?.name || "미배정"} → ${nextWorker.name}로 변경되었습니다.`,
+        });
+      }
+
+      resetForm();
+    } catch (e) {
+      console.error("Handover save failed:", e);
+      alert(`❌ 인계·인수서 저장 실패\n사유: ${safeMsg(e)}`);
+    }
+  };
+
+  const handleEdit = (doc: HandoverDocument) => {
+    setEditingId(doc.id);
+    setUserId(doc.userId);
+    setNextWorkerId(doc.nextWorkerId);
+    setHandoverPersonName(doc.handoverPersonName);
+    setSelectedPrevWorkerId(doc.prevWorkerId || "");
+    setHandoverDate(doc.handoverDate);
+    setTakeoverPersonName(doc.takeoverPersonName);
+    setTakeoverDate(doc.takeoverDate);
+    setReason(doc.reason);
+    setNotes(doc.notes || "");
+    setHandoverTasks(doc.handoverTasks || "");
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleDelete = async (id: string) => {
+    if (!confirm("정말 삭제하시겠습니까?")) return;
+    try {
+      await removeHandover(id);
+      toast({ title: "삭제 완료" });
+    } catch (e) {
+      alert("삭제 실패: " + safeMsg(e));
+    }
+  };
+
+  const resetForm = () => {
+    setEditingId(null);
+    setUserId("");
+    setNextWorkerId("");
+    setHandoverPersonName("");
+    setSelectedPrevWorkerId("");
+    setHandoverDate(new Date().toISOString().slice(0, 10));
+    setTakeoverPersonName("");
+    setTakeoverDate(new Date().toISOString().slice(0, 10));
+    setReason("");
+    setHandoverTasks("");
+    setNotes("");
+  };
+
+  const handlePrint = (doc: HandoverDocument) => {
+    setPrintDoc(doc);
+    setTimeout(() => {
+      window.print();
+    }, 100);
+  };
+
+  const sortedDocs = useMemo(() => {
+    return [...docs].sort((a, b) => (b.handoverDate || "").localeCompare(a.handoverDate || ""));
+  }, [docs]);
+
+  const getUserForDoc = (doc: HandoverDocument) => users.find((u) => u.id === doc.userId);
+
+  const getHandoverSupportSummary = (doc: HandoverDocument) => {
+    const user = getUserForDoc(doc);
+    return user?.supportTypes?.length ? user.supportTypes.join(", ") : "신체, 가사, 사회";
+  };
+
+  const getHandoverVoucherHours = (doc: HandoverDocument) => {
+    const user = getUserForDoc(doc);
+    const tier = user?.voucherTier || doc.voucherTier;
+    return VOUCHER_HOURS[tier] ? `${VOUCHER_HOURS[tier]}시간` : "—";
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* 인쇄용 영역 */}
+      {printDoc && (
+        <div className="hidden print:block fixed inset-0 bg-white z-[9999] overflow-auto">
+          <style>{`
+            @page { size: A4 portrait; margin: 15mm 12mm 15mm 12mm; }
+            @media print {
+              html, body { width: 210mm; min-height: 297mm; margin: 0 !important; padding: 0 !important; }
+              *, *::before, *::after { box-sizing: border-box !important; }
+              .handover-print-sheet {
+                width: 186mm;
+                min-height: 267mm;
+                color: #000;
+                font-family: 'Malgun Gothic', 'Dotum', sans-serif;
+                font-size: 10px;
+                line-height: 1.25;
+              }
+              .handover-print-sheet table { border-collapse: collapse; width: 100%; table-layout: fixed; }
+              .handover-print-sheet th, .handover-print-sheet td { border: 1px solid #000; padding: 1.4mm 1.8mm; vertical-align: middle; }
+              .handover-print-sheet th { background: #f2f2f2 !important; font-weight: 700; text-align: center; }
+              .handover-print-sheet .print-textbox { min-height: 33mm; white-space: pre-wrap; word-break: keep-all; vertical-align: top; }
+              .handover-print-sheet .print-important { min-height: 22mm; white-space: pre-wrap; word-break: keep-all; vertical-align: top; }
+              .handover-print-sheet > * { break-inside: avoid; page-break-inside: avoid; }
+            }
+          `}</style>
+          <div className="handover-print-sheet">
+            <h1 className="text-2xl font-bold text-center mb-4 underline decoration-double underline-offset-8">업무 인계 · 인수서</h1>
+
+            <h2 className="text-base font-bold mb-2">1. 인적사항</h2>
+            <table className="mb-3">
+              <tbody>
+                <tr>
+                  <th>인계자</th>
+                  <td>{printDoc.handoverPersonName}</td>
+                  <th>인계일</th>
+                  <td>{printDoc.handoverDate}</td>
+                </tr>
+                <tr>
+                  <th>인수자</th>
+                  <td>{printDoc.takeoverPersonName}</td>
+                  <th>인수일</th>
+                  <td>{printDoc.takeoverDate}</td>
+                </tr>
+                <tr>
+                  <th>인계사유</th>
+                  <td colSpan={3}>{printDoc.reason || "—"}</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <h2 className="text-base font-bold mb-2">수급자(이용자) 정보</h2>
+            <table className="mb-3">
+              <tbody>
+                <tr>
+                  <th>이름</th>
+                  <td>{printDoc.userName}</td>
+                  <th>성별</th>
+                  <td>{getUserForDoc(printDoc)?.gender || "—"}</td>
+                  <th>나이</th>
+                  <td>{getUserForDoc(printDoc)?.age ? `${getUserForDoc(printDoc)?.age}세` : "—"}</td>
+                </tr>
+                <tr>
+                  <th>연락처</th>
+                  <td>{printDoc.userPhone || "—"}</td>
+                  <th>주소</th>
+                  <td colSpan={3}>{printDoc.userAddress || getUserForDoc(printDoc)?.address || "—"}</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <h2 className="text-base font-bold mb-2">2. 인계 인수 업무사항</h2>
+            <table className="mb-3">
+              <tbody>
+                <tr>
+                  <th>바우처 구간</th>
+                  <td>{formatVoucherTier({ voucherTier: printDoc.voucherTier, voucherTierLabel: printDoc.voucherTierLabel })}</td>
+                  <th>시간</th>
+                  <td>{getHandoverVoucherHours(printDoc)}</td>
+                </tr>
+                <tr>
+                  <th>장애유형</th>
+                  <td>{printDoc.disabilityType || "—"}</td>
+                  <th>급여제공 내용</th>
+                  <td>{getHandoverSupportSummary(printDoc)}</td>
+                </tr>
+                <tr>
+                  <th>서비스 제공시 유의 사항 및 중요 문제점</th>
+                  <td colSpan={3} className="print-important">{printDoc.notes || "—"}</td>
+                </tr>
+                <tr>
+                  <th>인계 인수 업무 내용</th>
+                  <td colSpan={3} className="print-textbox">{printDoc.handoverTasks || "—"}</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div className="mt-4 text-center text-sm">
+              위와 같이 업무 인계 · 인수를 확인합니다.
+            </div>
+            <div className="mt-3 text-center text-sm">
+              {new Date().getFullYear()}년 {new Date().getMonth() + 1}월 {new Date().getDate()}일
+            </div>
+            <div className="mt-6 grid grid-cols-3 gap-6 text-center text-xs">
+              <div>
+                <p className="mb-2 font-bold">인계자</p>
+                <div className="h-12 border border-black flex items-center justify-center relative">
+                  <span>{printDoc.handoverPersonName}</span><span className="absolute right-2 bottom-1">(인)</span>
+                </div>
+              </div>
+              <div>
+                <p className="mb-2 font-bold">인수자</p>
+                <div className="h-12 border border-black flex items-center justify-center relative">
+                  <span>{printDoc.takeoverPersonName}</span><span className="absolute right-2 bottom-1">(인)</span>
+                </div>
+              </div>
+              <div>
+                <p className="mb-2 font-bold">확인</p>
+                <div className="h-12 border border-black flex items-center justify-center relative">
+                  <span className="absolute right-2 bottom-1">(인)</span>
+                </div>
+              </div>
+            </div>
+            <div className="mt-6 text-center">
+              <img src={dongbaekLogo} alt="동백" className="mx-auto h-12 w-auto object-contain" />
+            </div>
+          </div>
+          <button 
+            onClick={() => setPrintDoc(null)} 
+            className="print:hidden fixed top-4 right-4 bg-primary text-white p-2 rounded-full shadow-lg"
+          >
+            <X size={24} />
+          </button>
+        </div>
+      )}
+      <div className="flex items-center justify-between no-print">
+        <h1 className="page-header mb-0">업무 인계·인수서</h1>
+        <Badge variant="secondary">{sortedDocs.length}건</Badge>
+      </div>
+
+      <Card className="no-print">
+        <CardHeader className="flex flex-row items-center justify-between">
+          <CardTitle className="text-base">
+            {editingId ? "인계·인수서 수정" : "인계·인수서 작성"}
+          </CardTitle>
+          {editingId && (
+            <Button variant="ghost" size="sm" onClick={resetForm}>
+              <X className="w-4 h-4 mr-1" /> 취소
+            </Button>
+          )}
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <Label>이용자(수급자) 선택 *</Label>
+              <div className="mt-1">
+                <Popover open={isUserSearchOpen} onOpenChange={setIsUserSearchOpen}>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      role="combobox"
+                      aria-expanded={isUserSearchOpen}
+                      className="w-full justify-between"
+                    >
+                      {selectedUser?.name || "이용자 검색 및 선택"}
+                      <Search className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[400px] p-0">
+                    <Command>
+                      <CommandInput placeholder="이름 또는 연락처로 검색..." />
+                      <CommandList>
+                        <CommandEmpty>검색 결과가 없습니다.</CommandEmpty>
+                        <CommandGroup>
+                          {users.map((u) => (
+                            <CommandItem
+                              key={u.id}
+                              value={`${u.name} ${u.phone}`}
+                              onSelect={() => {
+                                setUserId(u.id!);
+                                setIsUserSearchOpen(false);
+                              }}
+                            >
+                              <div className="flex flex-col">
+                                <span className="font-medium">{u.name}</span>
+                                <span className="text-xs text-muted-foreground">{u.phone}</span>
+                              </div>
+                            </CommandItem>
+                          ))}
+                        </CommandGroup>
+                      </CommandList>
+                    </Command>
+                  </PopoverContent>
+                </Popover>
+              </div>
+            </div>
+
+            <div>
+              <Label>후임(인수자) 활동지원사 선택 *</Label>
+              <div className="mt-1">
+                <Popover open={isWorkerSearchOpen} onOpenChange={setIsWorkerSearchOpen}>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      role="combobox"
+                      aria-expanded={isWorkerSearchOpen}
+                      className="w-full justify-between"
+                    >
+                      {nextWorker ? labelWithLast4(nextWorker.name, nextWorker.phone) : "활동지원사 검색 및 선택"}
+                      <Search className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[400px] p-0">
+                    <Command>
+                      <CommandInput placeholder="이름 또는 연락처로 검색..." />
+                      <CommandList>
+                        <CommandEmpty>검색 결과가 없습니다.</CommandEmpty>
+                        <CommandGroup>
+                          {workers.filter((worker) => !isWorkerRetired(worker)).map((w) => (
+                            <CommandItem
+                              key={w.id}
+                              value={`${w.name} ${w.phone}`}
+                              onSelect={() => {
+                                setNextWorkerId(w.id!);
+                                setTakeoverPersonName(w.name);
+                                setIsWorkerSearchOpen(false);
+                              }}
+                            >
+                              <div className="flex flex-col">
+                                <span className="font-medium">{w.name} ({w.phone})</span>
+                                <span className="text-xs text-muted-foreground">{w.contractStatus} · {w.experience}</span>
+                              </div>
+                            </CommandItem>
+                          ))}
+                        </CommandGroup>
+                      </CommandList>
+                    </Command>
+                  </PopoverContent>
+                </Popover>
+              </div>
+            </div>
+          </div>
+
+          {selectedUser && (
+            <div className="border rounded-md p-3 bg-muted/30 text-sm space-y-1">
+              <div className="font-semibold">수급자 인적사항(자동 불러오기)</div>
+              <div>성명: {selectedUser?.name || "—"}</div>
+              <div>연락처: {selectedUser?.phone || "—"}</div>
+              <div className="truncate">주소: {selectedUser?.address || "—"}</div>
+              <div>바우처구간: {selectedUser ? formatVoucherTier(selectedUser) : "—"}</div>
+              <div>장애유형: {selectedUser?.disabilityType || "—"}</div>
+              <div className="pt-1 text-xs text-muted-foreground">
+                현재 담당(전임): {prevWorker ? labelWithLast4(prevWorker?.name || "이름없음", prevWorker?.phone || "") : "미배정"}
+              </div>
+              <div className="text-xs text-muted-foreground">기존 서비스 시간: {formatScheduleSummary(prevWorkerId ? selectedUser.assignmentSchedules?.[prevWorkerId] : undefined, selectedUser.requiredDays, selectedUser.requiredHours)}</div>
+            </div>
+          )}
+
+
+          <datalist id="handover-person-options">
+            {STAFF_NAMES.map((name) => <option key={`staff-${name}`} value={name} />)}
+            {workers.map((worker) => <option key={`worker-${worker.id}`} value={worker.name} />)}
+          </datalist>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label>인계자(전임 활동지원사/전담인력) *</Label>
+              <Popover open={isPrevWorkerSearchOpen} onOpenChange={setIsPrevWorkerSearchOpen}>
+                <PopoverTrigger asChild>
+                  <Button type="button" variant="outline" role="combobox" aria-expanded={isPrevWorkerSearchOpen} className="w-full justify-between">
+                    {prevWorker ? labelWithLast4(prevWorker.name, prevWorker.phone) : "퇴사자 포함 전체 활동지원사 검색"}
+                    <Search className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-[min(400px,calc(100vw-2rem))] p-0">
+                  <Command>
+                    <CommandInput placeholder="이름 또는 연락처로 검색..." />
+                    <CommandList>
+                      <CommandEmpty>검색 결과가 없습니다.</CommandEmpty>
+                      <CommandGroup heading="재직·대기·퇴사 전체">
+                        {workers.map((worker) => (
+                          <CommandItem
+                            key={worker.id}
+                            value={`${worker.name} ${worker.phone}`}
+                            onSelect={() => {
+                              setSelectedPrevWorkerId(worker.id || "");
+                              setHandoverPersonName(worker.name);
+                              setIsPrevWorkerSearchOpen(false);
+                            }}
+                          >
+                            <div className="flex w-full items-center justify-between gap-2">
+                              <div className="flex flex-col">
+                                <span className="font-medium">{worker.name} ({worker.phone})</span>
+                                <span className="text-xs text-muted-foreground">{worker.experience || "경력 미등록"}</span>
+                              </div>
+                              <Badge variant={isWorkerRetired(worker) ? "secondary" : "outline"}>{isWorkerRetired(worker) ? "퇴사" : worker.contractStatus}</Badge>
+                            </div>
+                          </CommandItem>
+                        ))}
+                      </CommandGroup>
+                    </CommandList>
+                  </Command>
+                </PopoverContent>
+              </Popover>
+              <Input list="handover-person-options" value={handoverPersonName} onChange={(e) => setHandoverPersonName(e.target.value)} placeholder="전담인력은 직접 입력할 수 있습니다." />
+              <p className="text-xs text-muted-foreground">퇴사한 활동지원사도 이름·연락처로 검색됩니다.</p>
+            </div>
+            <div>
+              <Label>인계일 *</Label>
+              <Input type="date" value={handoverDate} onChange={(e) => setHandoverDate(e.target.value)} />
+            </div>
+            <div>
+              <Label>인수자(후임자/전담인력) 성명 *</Label>
+              <Input list="handover-person-options" value={takeoverPersonName} onChange={(e) => setTakeoverPersonName(e.target.value)} placeholder="후임자 또는 전담인력 검색/입력" />
+            </div>
+            <div>
+              <Label>인수일 *</Label>
+              <Input type="date" value={takeoverDate} onChange={(e) => setTakeoverDate(e.target.value)} />
+            </div>
+          </div>
+
+          <div className="flex flex-col">
+            <Label>인계사유 *</Label>
+            <Textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="예: 담당 활동지원사 변경, 개인사정, 기관변경 등" />
+            <SpellCheckButton value={reason} onApply={setReason} />
+          </div>
+          <div className="flex flex-col">
+            <Label>인계 인수 업무사항</Label>
+            <Textarea value={handoverTasks} onChange={(e) => setHandoverTasks(e.target.value)} placeholder="장문의 업무 내용 입력" />
+            <SpellCheckButton value={handoverTasks} onApply={setHandoverTasks} />
+          </div>
+
+          <div>
+            <Label>서비스 제공시 유의 사항 및 중요 문제점</Label>
+            <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} />
+            <SpellCheckButton value={notes} onApply={setNotes} />
+          </div>
+
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={resetForm} disabled={loading}>초기화</Button>
+            <Button onClick={handleSave} disabled={loading}>{editingId ? "수정 저장" : "신규 저장"}</Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="no-print">
+        <CardHeader>
+          <CardTitle className="text-base">작성 내역</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          {sortedDocs.length === 0 ? (
+            <p className="text-sm text-muted-foreground">작성된 인계·인수서가 없습니다.</p>
+          ) : (
+            <div className="divide-y border rounded-md">
+              {sortedDocs.map((d) => (
+                <div key={d.id} className="p-3 text-sm flex flex-col gap-2 hover:bg-muted/30 transition-colors">
+                  <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-1">
+                    <div className="font-medium">{d?.userName || "이름없음"} ({d?.userPhone || "-"})</div>
+                    <div className="text-muted-foreground">{d?.handoverDate || "-"} · {d?.reason || "-"}</div>
+                  </div>
+                  <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-2">
+                    <div className="text-xs text-muted-foreground">
+                      담당 변경: {d?.prevWorkerName ? labelWithLast4(d.prevWorkerName, d?.prevWorkerPhone || "") : "미배정"} → {d?.nextWorkerName ? labelWithLast4(d.nextWorkerName, d?.nextWorkerPhone || "") : "—"}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Button variant="outline" size="sm" onClick={() => handlePrint(d)}>
+                        <Printer className="w-4 h-4 mr-1" /> 인쇄
+                      </Button>
+                      <Button variant="outline" size="sm" onClick={() => handleEdit(d)}>
+                        <Edit2 className="w-4 h-4 mr-1" /> 수정
+                      </Button>
+                      <Button variant="ghost" size="sm" className="text-destructive hover:text-destructive" onClick={() => handleDelete(d.id)}>
+                        <Trash2 className="w-4 h-4" />
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}

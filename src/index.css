@@ -1,0 +1,93 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 98%;
+    --foreground: 220 20% 15%;
+    --card: 0 0% 100%;
+    --card-foreground: 220 20% 15%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 20% 15%;
+    --primary: 355 70% 45%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 145 45% 38%;
+    --secondary-foreground: 0 0% 100%;
+    --muted: 220 14% 94%;
+    --muted-foreground: 220 10% 46%;
+    --accent: 45 90% 55%;
+    --accent-foreground: 220 20% 15%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 13% 88%;
+    --input: 220 13% 88%;
+    --ring: 355 70% 45%;
+    --radius: 0.5rem;
+    --sidebar-background: 0 0% 100%;
+    --sidebar-foreground: 220 20% 15%;
+    --sidebar-primary: 355 70% 45%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 355 70% 96%;
+    --sidebar-accent-foreground: 355 70% 35%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 355 70% 45%;
+    --success: 145 45% 38%;
+    --success-foreground: 0 0% 100%;
+    --warning: 45 90% 55%;
+    --warning-foreground: 220 20% 15%;
+    --info: 210 70% 50%;
+    --info-foreground: 0 0% 100%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+}
+
+@layer utilities {
+  .card-hover {
+    @apply transition-all duration-200 hover:shadow-md hover:-translate-y-0.5;
+  }
+  .stat-card {
+    @apply bg-card rounded-lg border p-4 card-hover;
+  }
+  .page-header {
+    @apply text-2xl font-bold text-foreground mb-6;
+  }
+  .section-title {
+    @apply text-lg font-semibold text-foreground mb-4;
+  }
+}
+
+
+@media print {
+  @page { size: A4 portrait; margin: 15mm 12mm 15mm 12mm; }
+  html, body { width: 210mm; min-height: 297mm; margin: 0 !important; padding: 0 !important; }
+  *, *::before, *::after { box-sizing: border-box !important; }
+  .no-print { display: none !important; }
+  body { background: white !important; }
+  table, tr, .print-avoid { break-inside: avoid; page-break-inside: avoid; }
+  table { width: 100%; table-layout: fixed; }
+  td, th { overflow-wrap: anywhere; }
+}
+
+
+/* Screen-only mobile ergonomics; official A4 print styles remain unchanged. */
+@media screen and (max-width: 639px) {
+  .app-main { overflow-x: clip; }
+  .app-main .page-header { font-size: 1.25rem; line-height: 1.5; }
+  .app-main .stat-card { padding: 0.75rem; }
+  .app-main [class*="grid"] > *, [role="dialog"] [class*="grid"] > * { min-width: 0; }
+  [role="dialog"] { max-width: calc(100vw - 1.5rem); max-height: calc(100dvh - 2rem); }
+  [role="dialog"] input, [role="dialog"] textarea, [role="dialog"] select,
+  .app-main input, .app-main textarea, .app-main select { font-size: 16px; min-width: 0; }
+  [role="dialog"] h2 { padding-right: 1.5rem; line-height: 1.4; }
+  .app-main p, .app-main dd, [role="dialog"] dd { overflow-wrap: anywhere; }
+}

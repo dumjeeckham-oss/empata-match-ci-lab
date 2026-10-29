@@ -1,0 +1,706 @@
+/* eslint-disable @typescript-eslint/no-explicit-any, no-irregular-whitespace */
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { useCollection } from "@/hooks/useFirestore";
+import { type MatchingHistoryRecord, type ServiceUser, type TerminationDocument, type Worker, TERMINATION_REASONS } from "@/types";
+import { USERS_COLLECTION, WORKERS_COLLECTION, TERMINATIONS_COLLECTION, MATCHING_HISTORY_COLLECTION } from "@/lib/collectionNames";
+import dongbaekLogo from "@/assets/dongbaek-logo.png";
+import dongbaekCenterLogo from "@/assets/dongbaek-center-logo.png";
+import { TerminationPrintSheet } from "@/components/TerminationPrintSheet";
+import { syncUserToWorkers } from "@/lib/assignments";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { SpellCheckButton } from "@/components/SpellCheckButton";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Badge } from "@/components/ui/badge";
+import { toast } from "@/hooks/use-toast";
+import { Timestamp, db, collection, doc, writeBatch } from "@/lib/firebase";
+import { Search, Printer, Edit2, Trash2, X } from "lucide-react";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { cn } from "@/lib/utils";
+import { OFFICIAL_TERMINATION_PROJECT_NAME, resolveTerminationWorkerRefs } from "@/lib/terminationWorkers";
+import { formatVoucherTier } from "@/lib/userVoucher";
+import { appendContractTransition, appendEmploymentTransition, closeMatchingEntries, removeUserAssignment } from "@/lib/statusLifecycle";
+import { sanitizeForFirestore } from "@/lib/bulkUpload";
+
+function safeMsg(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  return String(e);
+}
+
+const displayTerminationReason = (reason: string) => reason === "가족활동가" ? "가족이 직접 돌봄" : reason;
+const isTerminationReasonSelected = (reasons: string[], reason: string) =>
+  reasons.includes(reason) || (reason === "가족이 직접 돌봄" && reasons.includes("가족활동가"));
+
+export default function Terminations() {
+  const [searchParams] = useSearchParams();
+  const { data: usersRaw, update: updateUser } = useCollection<ServiceUser>(USERS_COLLECTION);
+  const { data: workersRaw } = useCollection<Worker>(WORKERS_COLLECTION);
+  const { data: docsRaw, remove: removeDoc, loading } = useCollection<TerminationDocument>(TERMINATIONS_COLLECTION);
+  const { data: matchingHistoryRaw } = useCollection<MatchingHistoryRecord>(MATCHING_HISTORY_COLLECTION);
+  const users = usersRaw || [];
+  const workers = workersRaw || [];
+  const docs = docsRaw || [];
+  const matchingLogs = matchingHistoryRaw || [];
+
+  const requestedAction = searchParams.get("action") === "waiting" ? "대기" : "계약해지";
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [printDoc, setPrintDoc] = useState<TerminationDocument | null>(null);
+  const [workerAfterStatus, setWorkerAfterStatus] = useState<"대기" | "퇴사">("대기");
+
+  const [form, setForm] = useState<Omit<TerminationDocument, "id" | "createdAt" | "updatedAt">>({
+    userId: "",
+    userName: "",
+    userPhone: "",
+    date: new Date().toISOString().slice(0, 10),
+    reasons: [],
+    reasonDetail: "",
+    handoverNote: "",
+    approverDandang: "",
+    approverCenterJang: "",
+    projectName: OFFICIAL_TERMINATION_PROJECT_NAME,
+    residentNumber: "",
+    approvalDate: new Date().toISOString().slice(0, 10),
+    assignedWorkerName: "",
+    completionAction: requestedAction,
+  });
+
+  const selectedUser = useMemo(
+    () => users.find((u) => u.id === form.userId),
+    [users, form.userId]
+  );
+  const getLinkedWorkersForUser = (user: ServiceUser | undefined) => {
+    const refs = resolveTerminationWorkerRefs(user, matchingLogs);
+    const ids = new Set(refs.map((ref) => ref.id).filter(Boolean));
+    const names = new Set(refs.map((ref) => ref.name).filter(Boolean));
+    return workers.filter((worker) => (worker.id ? ids.has(worker.id) : false) || names.has(String(worker.name || "").trim()));
+  };
+
+  const getAssignedWorkerNames = (user: ServiceUser | undefined) => {
+    const refs = resolveTerminationWorkerRefs(user, matchingLogs);
+    const linked = getLinkedWorkersForUser(user).map((worker) => worker.name).filter(Boolean);
+    const historical = refs.map((ref) => ref.name).filter(Boolean);
+    return Array.from(new Set([...linked, ...historical]));
+  };
+
+  const handleSelectUser = (u: ServiceUser) => {
+    // 선택한 이용자의 담당 활동지원사를 자동으로 찾아 채움
+    const workerName = getAssignedWorkerNames(u).join(", ");
+    setForm((f) => ({
+      ...f,
+      userId: u.id || "",
+      userName: u.name || "",
+      userPhone: u.phone || "",
+      assignedWorkerName: workerName,
+    }));
+    setIsSearchOpen(false);
+  };
+  useEffect(() => {
+    const userId = searchParams.get("userId");
+    const endDate = searchParams.get("endDate");
+    if (!userId || form.userId) return;
+    const user = users.find((item) => item.id === userId);
+    if (user) {
+      handleSelectUser(user);
+      if (endDate) setForm((current) => ({ ...current, date: endDate, approvalDate: endDate }));
+    }
+  }, [searchParams, users, form.userId]);
+
+
+  useEffect(() => {
+    if (!selectedUser || form.assignedWorkerName.trim()) return;
+    const names = getAssignedWorkerNames(selectedUser).join(", ");
+    if (names) setForm((current) => ({ ...current, assignedWorkerName: names }));
+  }, [selectedUser, matchingLogs, workers, form.assignedWorkerName]);
+
+  const toggleReason = (reason: string) => {
+    setForm((f) => ({
+      ...f,
+      reasons: isTerminationReasonSelected(f.reasons, reason)
+        ? f.reasons.filter((r) => r !== reason && !(reason === "가족이 직접 돌봄" && r === "가족활동가"))
+        : [...f.reasons, reason],
+    }));
+  };
+
+  const handleSave = async () => {
+    try {
+      if (!form.userId) {
+        alert("❌ 저장 불가: 이용자를 선택해주세요.");
+        return;
+      }
+      if (!form.date) {
+        alert("❌ 저장 불가: 종결일자를 입력해주세요.");
+        return;
+      }
+      if (form.reasons.length === 0 && !form.reasonDetail.trim()) {
+        alert("❌ 저장 불가: 종결 사유를 1개 이상 선택하거나 상세 사유를 입력해주세요.");
+        return;
+      }
+
+      const terminationReasonText = [
+        ...form.reasons,
+        form.reasonDetail.trim() ? "상세:" + form.reasonDetail.trim() : "",
+      ].filter(Boolean).join(" / ");
+      const terminatingUser = users.find((user) => user.id === form.userId);
+      if (!terminatingUser?.id) throw new Error("선택한 이용자 정보를 다시 불러오지 못했습니다.");
+
+      const completionAction = form.completionAction || requestedAction;
+      const linkedWorkers = getLinkedWorkersForUser(terminatingUser)
+        .filter((worker): worker is Worker & { id: string } => Boolean(worker.id));
+      const activeLinkedWorkers = linkedWorkers.filter((worker) => {
+        const workerHasUser = (worker.assignedUserIds || worker.assigned_users || []).includes(terminatingUser.id!);
+        const userHasWorker = (terminatingUser.assignedHelperIds || terminatingUser.assigned_workers || []).includes(worker.id);
+        const openDocumentPeriod = (terminatingUser.matchingHistory || []).some((entry) =>
+          entry.workerId === worker.id && (entry.serviceEndDate === null || entry.serviceEndDate === "")
+        );
+        return workerHasUser || userHasWorker || openDocumentPeriod;
+      });
+      const previousHelperIds = activeLinkedWorkers.map((worker) => worker.id);
+      const nextUserStatus = completionAction === "대기" ? "대기" : "계약해지";
+      const userTerminationPayload: Partial<ServiceUser> = {
+        contractStatus: nextUserStatus,
+        terminationReason: terminationReasonText,
+        txtUMemostop: terminationReasonText,
+        resignationDate: completionAction === "계약해지" ? form.date : "",
+        assignedHelperIds: [],
+        assigned_workers: [],
+        assignedHelperNames: [],
+        assignedHelperPhones: [],
+        matchingHistory: closeMatchingEntries(terminatingUser.matchingHistory, previousHelperIds, form.date, terminationReasonText),
+        contractHistory: appendContractTransition(terminatingUser, form.date, nextUserStatus, terminationReasonText),
+      };
+
+      const batch = writeBatch(db);
+      const terminationRef = editingId
+        ? doc(db, TERMINATIONS_COLLECTION, editingId)
+        : doc(collection(db, TERMINATIONS_COLLECTION));
+      const documentPayload = sanitizeForFirestore({
+        ...form,
+        completionAction,
+        projectName: OFFICIAL_TERMINATION_PROJECT_NAME,
+        updatedAt: Timestamp.now(),
+        ...(editingId ? {} : { createdAt: Timestamp.now() }),
+      });
+      batch.set(terminationRef, documentPayload, { merge: Boolean(editingId) });
+      batch.update(doc(db, USERS_COLLECTION, terminatingUser.id), sanitizeForFirestore({
+        ...userTerminationPayload,
+        updatedAt: Timestamp.now(),
+      }));
+
+      for (const worker of activeLinkedWorkers) {
+        const assignment = removeUserAssignment(worker, terminatingUser.id);
+        const remainingCount = assignment.assignedUserIds.length;
+        const retireWorker = workerAfterStatus === "퇴사" && remainingCount === 0;
+        batch.update(doc(db, WORKERS_COLLECTION, worker.id), sanitizeForFirestore({
+          ...assignment,
+          contractStatus: retireWorker ? "퇴사" : remainingCount > 0 ? "근무중" : "대기",
+          waitingForMatch: !retireWorker && remainingCount === 0,
+          serviceEndDate: remainingCount === 0 ? form.date : null,
+          retirementDate: retireWorker ? form.date : "",
+          resignationDate: retireWorker ? form.date : "",
+          employmentHistory: retireWorker ? appendEmploymentTransition(worker, form.date, terminationReasonText) : worker.employmentHistory || [],
+          updatedAt: Timestamp.now(),
+        }));
+        const historyRef = doc(collection(db, MATCHING_HISTORY_COLLECTION));
+        batch.set(historyRef, {
+          type: "해제",
+          userId: terminatingUser.id,
+          userName: terminatingUser.name,
+          userPhone: terminatingUser.phone,
+          workerId: worker.id,
+          workerName: worker.name,
+          workerPhone: worker.phone,
+          date: terminatingUser.serviceStartDate || form.date,
+          endDate: form.date,
+          reason: "종료",
+          reasonDetail: terminationReasonText,
+          notes: "종결승인서 저장에 따른 서비스 종료",
+          createdAt: Timestamp.now(),
+          updatedAt: Timestamp.now(),
+        });
+      }
+      await batch.commit();
+
+      toast({
+        title: editingId ? "종결승인서 수정 완료" : "종결승인서 저장 완료",
+        description: completionAction === "대기"
+          ? "현재 서비스 이력을 종료하고 이용자를 매칭 대기로 전환했습니다."
+          : "계약해지일과 담당 지원사의 서비스 종료일을 함께 반영했습니다.",
+      });
+      resetForm();
+    } catch (e) {
+      console.error("Termination save failed:", e);
+      alert("❌ 종결승인서 저장 실패\n사유: " + safeMsg(e));
+    }
+  };
+
+  const handleEdit = (doc: TerminationDocument) => {
+    setEditingId(doc.id || null);
+    setForm({
+      userId: doc.userId || "",
+      userName: doc.userName || "",
+      userPhone: doc.userPhone || "",
+      date: doc.date || new Date().toISOString().slice(0, 10),
+      reasons: doc.reasons || [],
+      reasonDetail: doc.reasonDetail || "",
+      handoverNote: doc.handoverNote || "",
+      approverDandang: doc.approverDandang || "",
+      approverCenterJang: doc.approverCenterJang || "",
+      projectName: OFFICIAL_TERMINATION_PROJECT_NAME,
+      residentNumber: doc.residentNumber || "",
+      approvalDate: doc.approvalDate || doc.date || new Date().toISOString().slice(0, 10),
+      assignedWorkerName: doc.assignedWorkerName || getAssignedWorkerNames(users.find((u) => u.id === doc.userId)).join(", "),
+      completionAction: doc.completionAction || "계약해지",
+    });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    const docId = searchParams.get("docId") || searchParams.get("id");
+    if (!docId || editingId) return;
+    const targetDoc = docs.find((item) => item.id === docId);
+    if (targetDoc) handleEdit(targetDoc);
+  }, [searchParams, docs, editingId]);
+  const handleDelete = async (id: string) => {
+    if (!confirm("정말 삭제하시겠습니까?")) return;
+    try {
+      await removeDoc(id);
+      toast({ title: "삭제 완료" });
+    } catch (e) {
+      alert("삭제 실패: " + safeMsg(e));
+    }
+  };
+
+  const resetForm = () => {
+    setEditingId(null);
+    setForm({
+      userId: "",
+      userName: "",
+      userPhone: "",
+      date: new Date().toISOString().slice(0, 10),
+      reasons: [],
+      reasonDetail: "",
+      handoverNote: "",
+      approverDandang: "",
+      approverCenterJang: "",
+      projectName: OFFICIAL_TERMINATION_PROJECT_NAME,
+      residentNumber: "",
+      approvalDate: new Date().toISOString().slice(0, 10),
+      assignedWorkerName: "",
+      completionAction: requestedAction,
+    });
+    setWorkerAfterStatus("대기");
+  };
+
+  const handlePrint = (doc: TerminationDocument) => {
+    setPrintDoc(doc);
+    setTimeout(() => {
+      window.print();
+    }, 100);
+  };
+
+  const sortedDocs = useMemo(() => {
+    return [...docs].sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  }, [docs]);
+
+  return (
+    <div className="space-y-6">
+      {printDoc && <TerminationPrintSheet document={printDoc} address={users.find((user) => user.id === printDoc.userId)?.address || ""} workerNames={printDoc.assignedWorkerName || getAssignedWorkerNames(users.find((user) => user.id === printDoc.userId)).join(", ")} logoSrc={dongbaekCenterLogo} />}
+      
+{/* ── 인쇄용 영역: 종결승인서 A4 단일 페이지 ── */}
+      {printDoc && (
+        <div className="hidden print:hidden fixed inset-0 bg-white z-[9999]">
+          <style>{`
+            @page {
+              size: A4 portrait;
+              margin: 15mm 12mm 15mm 12mm;
+            }
+            @media print {
+              html, body { width: 210mm; min-height: 297mm; margin: 0 !important; padding: 0 !important; }
+              *, *::before, *::after { box-sizing: border-box !important; }
+              .print-sheet {
+                width: 186mm;
+                min-height: 267mm;
+                max-height: 267mm;
+                box-sizing: border-box;
+                overflow: hidden;
+                font-size: 9.5px;
+                line-height: 1.25;
+                color: #000;
+                font-family: 'Malgun Gothic', 'Dotum', sans-serif;
+              }
+              .print-sheet > * { break-inside: avoid; page-break-inside: avoid; }
+              .print-sheet table { border-collapse: collapse; width: 100%; table-layout: fixed; break-inside: avoid; page-break-inside: avoid; }
+              .print-sheet table td,
+              .print-sheet table th {
+                border: 1px solid #000;
+                padding: 1.2mm 1.8mm;
+                vertical-align: middle;
+              }
+            }
+          `}</style>
+
+          <div className="print-sheet">
+            {/* ── 제목 + 결재란 (상단 박스) ── */}
+            <table style={{ marginBottom: "3mm", tableLayout: "fixed" }}>
+              <tbody>
+                <tr>
+                  <td style={{
+                    textAlign: "center",
+                    fontWeight: 700,
+                    fontSize: "16px",
+                    letterSpacing: "6px",
+                    border: "1px solid #000",
+                    padding: "2.5mm 0",
+                    width: "68%",
+                  }} rowSpan={2}>
+                    종 결 승 인 서
+                  </td>
+                  <th style={{ textAlign: "center", width: "16%", height: "8mm" }}>담당자</th>
+                  <th style={{ textAlign: "center", width: "16%", height: "8mm" }}>센터장</th>
+                </tr>
+                <tr>
+                  <td style={{ height: "13mm" }}></td>
+                  <td style={{ height: "13mm" }}></td>
+                </tr>
+              </tbody>
+            </table>
+
+            {/* ── 설명문 ── */}
+            <div style={{
+              border: "1px solid #000",
+              padding: "2mm 3mm",
+              fontSize: "8.5px",
+              lineHeight: 1.4,
+              marginBottom: "2mm",
+              wordBreak: "keep-all",
+            }}>
+              부천의료복지사회적협동조합 동백장애인활동지원센터에서 장애인활동지원서비스를 제공 받았던 장애인 이용자를 아래와 같은 사유로 종결하고자 합니다. 검토후 재가바랍니다.
+            </div>
+
+            {/* ── 정보 테이블 ── */}
+            <table style={{ marginBottom: "3mm", fontSize: "9.5px" }}>
+              <tbody>
+                <tr>
+                  <th style={{ backgroundColor: "#f5f5f5", width: "18%", textAlign: "center" }}>사 업 명</th>
+                  <td style={{ width: "32%" }}>{OFFICIAL_TERMINATION_PROJECT_NAME}</td>
+                  <th style={{ backgroundColor: "#f5f5f5", width: "18%", textAlign: "center" }}>담당 활동지원사</th>
+                  <td style={{ width: "32%" }}>{printDoc?.assignedWorkerName || getAssignedWorkerNames(users.find(u => u.id === printDoc?.userId)).join(", ") || "—"}</td>
+                </tr>
+                <tr>
+                  <th style={{ backgroundColor: "#f5f5f5", textAlign: "center" }}>이용 종결자</th>
+                  <td style={{ fontWeight: 700 }}>{printDoc?.userName || "—"}</td>
+                  <th style={{ backgroundColor: "#f5f5f5", textAlign: "center" }}>종결사유</th>
+                  <td>{(printDoc?.reasons || []).map(displayTerminationReason).join(", ") || "—"}</td>
+                </tr>
+                <tr>
+                  <th style={{ backgroundColor: "#f5f5f5", textAlign: "center" }}>주민등록번호</th>
+                  <td>{printDoc.residentNumber || "—"}</td>
+                  <th style={{ backgroundColor: "#f5f5f5", textAlign: "center" }}>종결 일시</th>
+                  <td>{printDoc?.date || "—"}</td>
+                </tr>
+                <tr>
+                  <th style={{ backgroundColor: "#f5f5f5", textAlign: "center" }}>주 소</th>
+                  <td colSpan={3}>
+                    {users.find(u => u.id === printDoc?.userId)?.address
+                      || selectedUser?.address || "—"}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            {/* ── 하단: 종결종류 바로 아래 종결사유 ── */}
+            <table style={{ marginBottom: "2mm", fontSize: "9px", tableLayout: "fixed" }}>
+              <tbody>
+                <tr>
+                  <th style={{ backgroundColor: "#f5f5f5", textAlign: "center", fontSize: "9.5px" }}>
+                    종 결 종 류
+                  </th>
+                </tr>
+                <tr style={{ height: "48mm" }}>
+                  <td style={{ verticalAlign: "top", padding: "2mm", lineHeight: 1.45 }}>
+                    {TERMINATION_REASONS.map(r => (
+                      <div key={r} style={{ display: "flex", alignItems: "center", gap: "1.5mm", fontSize: "8.2px", marginBottom: "0.6mm" }}>
+                        <span style={{
+                          display: "inline-block",
+                          width: "3mm",
+                          height: "3mm",
+                          border: "1px solid #000",
+                          textAlign: "center",
+                          lineHeight: "3mm",
+                          fontSize: "6px",
+                          fontWeight: 700,
+                          flexShrink: 0,
+                        }}>
+                          {isTerminationReasonSelected(printDoc?.reasons || [], r) ? "✓" : ""}
+                        </span>
+                        <span>{r}</span>
+                      </div>
+                    ))}
+                  </td>
+                </tr>
+                <tr>
+                  <th style={{ backgroundColor: "#f5f5f5", textAlign: "center", fontSize: "9.5px" }}>
+                    종 결 사 유
+                  </th>
+                </tr>
+                <tr style={{ height: "55mm" }}>
+                  <td style={{ verticalAlign: "top", padding: "2mm", fontSize: "8.5px", lineHeight: 1.35, whiteSpace: "pre-wrap", wordBreak: "keep-all" }}>
+                    {printDoc?.reasonDetail || ""}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            {/* ── 하단: 로고만 표시 ── */}
+            <div style={{ textAlign: "center", marginTop: "4mm" }}>
+              <img
+                src={dongbaekLogo}
+                alt="동백"
+                style={{
+                  display: "block",
+                  margin: "0 auto",
+                  maxWidth: "28mm",
+                  maxHeight: "13mm",
+                  objectFit: "contain",
+                }}
+              />
+            </div>
+          </div>
+
+          <button
+            onClick={() => setPrintDoc(null)}
+            className="print:hidden no-print print-close-btn fixed top-4 right-4 bg-primary text-white p-2 rounded-full shadow-lg z-50 hover:bg-primary/90"
+          >
+            <X size={20} />
+          </button>
+        </div>
+      )}
+
+
+      <div className="flex items-center justify-between no-print">
+        <h1 className="page-header mb-0">종결승인서</h1>
+        <Badge variant="secondary">{sortedDocs.length}건</Badge>
+      </div>
+
+      <Card className="no-print">
+        <CardHeader className="flex flex-row items-center justify-between">
+          <CardTitle className="text-base">
+            {editingId ? "종결승인서 수정" : "종결승인서 작성"}
+          </CardTitle>
+          {editingId && (
+            <Button variant="ghost" size="sm" onClick={resetForm}>
+              <X className="w-4 h-4 mr-1" /> 취소
+            </Button>
+          )}
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <Label>이용 종결자 선택 *</Label>
+              <div className="mt-1">
+                <Popover open={isSearchOpen} onOpenChange={setIsSearchOpen}>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      role="combobox"
+                      aria-expanded={isSearchOpen}
+                      className="w-full justify-between"
+                    >
+                      {form.userName || "이용자 검색 및 선택"}
+                      <Search className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[400px] p-0">
+                    <Command>
+                      <CommandInput placeholder="이름 또는 연락처로 검색..." />
+                      <CommandList>
+                        <CommandEmpty>검색 결과가 없습니다.</CommandEmpty>
+                        <CommandGroup>
+                          {users.map((u) => (
+                            <CommandItem
+                              key={u.id}
+                              value={`${u.name} ${u.phone}`}
+                              onSelect={() => handleSelectUser(u)}
+                            >
+                              <div className="flex flex-col">
+                                <span className="font-medium">{u.name}</span>
+                                <span className="text-xs text-muted-foreground">{u.phone}</span>
+                              </div>
+                            </CommandItem>
+                          ))}
+                        </CommandGroup>
+                      </CommandList>
+                    </Command>
+                  </PopoverContent>
+                </Popover>
+              </div>
+              {selectedUser && (
+                <p className="text-xs text-muted-foreground mt-1">
+                  주소: {selectedUser.address || "—"} / 바우처: {formatVoucherTier(selectedUser)} / 장애유형: {selectedUser.disabilityType || "—"}
+                </p>
+              )}
+            </div>
+            <div>
+              <Label>담당 활동지원사 (자동 채움)</Label>
+              <Input value={form.assignedWorkerName || ""} onChange={(e) => setForm((f) => ({ ...f, assignedWorkerName: e.target.value }))} placeholder="이용자 선택 시 자동 채움" />
+            </div>            <div>
+              <Label>문서 저장 후 이용자 상태</Label>
+              <Select value={form.completionAction || requestedAction} onValueChange={(value) => setForm((current) => ({ ...current, completionAction: value as "계약해지" | "대기" }))}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="계약해지">계약해지</SelectItem>
+                  <SelectItem value="대기">매칭을 위한 대기</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label>종결 후 활동지원사 상태</Label>
+              <Select value={workerAfterStatus} onValueChange={(value) => setWorkerAfterStatus(value as "대기" | "퇴사")}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="대기">대기</SelectItem>
+                  <SelectItem value="퇴사">퇴사</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <Label>종결사유</Label>
+              <Input value={form.reasons.map(displayTerminationReason).join(", ") || ""} readOnly className="bg-muted" placeholder="하단 사유 선택 시 자동 채움" />
+            </div>
+            <div>
+              <Label>주민등록번호</Label>
+              <Input value={form.residentNumber || ""} onChange={(e) => setForm((f) => ({ ...f, residentNumber: e.target.value }))} placeholder="000000-0000000" />
+            </div>
+            <div>
+              <Label>종결일시 *</Label>
+              <Input type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} />
+            </div>
+          </div>
+
+          <div>
+            <Label>주소</Label>
+            <Input value={selectedUser?.address || ""} readOnly className="bg-muted" placeholder="이용자 선택 시 자동 채움" />
+          </div>
+
+          {/* ── 좌: 종결종류 / 우: 종결사유 2단 분할 ── */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div>
+              <Label>종결 종류 (복수 선택) *</Label>
+              <div className="border rounded-md p-3 mt-2 space-y-1.5">
+                {TERMINATION_REASONS.map((r) => (
+                  <label key={r} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-muted/50 px-1 py-0.5 rounded">
+                    <Checkbox checked={isTerminationReasonSelected(form.reasons, r)} onCheckedChange={() => toggleReason(r)} />{r}
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div>
+              <Label>종결 사유</Label>
+              {form.reasons.includes("개인사정") || form.reasons.includes("기타") ? (
+                <p className="text-xs text-amber-600 font-medium mt-1 mb-1">
+                  ⚠ {form.reasons.filter(r => r === "개인사정" || r === "기타").join(", ")} 사유이므로 상세 내용을 반드시 작성해주세요.
+                </p>
+              ) : (
+                <p className="text-xs text-muted-foreground mt-1 mb-1">
+                  선택한 종결 종류: {form.reasons.length > 0 ? form.reasons.join(", ") : "없음"}
+                </p>
+              )}
+              <Textarea
+                className="min-h-[200px]"
+                value={form.reasonDetail}
+                onChange={(e) => setForm((f) => ({ ...f, reasonDetail: e.target.value }))}
+                placeholder={form.reasons.includes("개인사정") 
+                  ? "개인사정에 해당하는 구체적인 사유를 작성해주세요."
+                  : form.reasons.includes("기타")
+                  ? "기타에 해당하는 구체적인 사유를 작성해주세요."
+                  : "종결 사유에 대한 상세 내용을 작성해주세요."}
+              />
+              <SpellCheckButton value={form.reasonDetail} onApply={(reasonDetail) => setForm((f) => ({ ...f, reasonDetail }))} />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <Label>결재일</Label>
+              <Input type="date" value={form.approvalDate || ""} onChange={(e) => setForm((f) => ({ ...f, approvalDate: e.target.value }))} />
+            </div>
+            <div>
+              <Label>담당 결재자</Label>
+              <Input value={form.approverDandang || ""} onChange={(e) => setForm((f) => ({ ...f, approverDandang: e.target.value }))} />
+            </div>
+            <div>
+              <Label>센터장 결재자</Label>
+              <Input value={form.approverCenterJang || ""} onChange={(e) => setForm((f) => ({ ...f, approverCenterJang: e.target.value }))} />
+            </div>
+          </div>
+
+          <div>
+            <Label>인계 메모(선택)</Label>
+            <Textarea value={form.handoverNote || ""} onChange={(e) => setForm((f) => ({ ...f, handoverNote: e.target.value }))} />
+            <SpellCheckButton value={form.handoverNote || ""} onApply={(handoverNote) => setForm((f) => ({ ...f, handoverNote }))} />
+          </div>
+
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={resetForm} disabled={loading}>초기화</Button>
+            <Button onClick={handleSave} disabled={loading}>{editingId ? "수정 저장" : "신규 저장"}</Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="no-print">
+        <CardHeader>
+          <CardTitle className="text-base">작성 내역</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          {sortedDocs.length === 0 ? (
+            <p className="text-sm text-muted-foreground">작성된 종결확인서가 없습니다.</p>
+          ) : (
+            <div className="divide-y border rounded-md">
+              {sortedDocs.map((d) => (
+                <div key={d.id} className="p-3 text-sm flex flex-col md:flex-row md:items-center md:justify-between gap-3 hover:bg-muted/30 transition-colors">
+                  <div>
+                    <div className="font-medium">{d.userName}</div>
+                    <div className="text-xs text-muted-foreground">{d.userPhone}</div>
+                  </div>
+                  <div className="flex-grow text-muted-foreground">{d.date} · {(d.reasons || []).join(", ") || "—"}</div>
+                  <div className="flex items-center gap-2">
+                    <Button variant="outline" size="sm" onClick={() => handlePrint(d)}>
+                      <Printer className="w-4 h-4 mr-1" /> 인쇄
+                    </Button>
+                    <Button variant="outline" size="sm" onClick={() => handleEdit(d)}>
+                      <Edit2 className="w-4 h-4 mr-1" /> 수정
+                    </Button>
+                    <Button variant="ghost" size="sm" className="text-destructive hover:text-destructive" disabled={!d.id} onClick={() => d.id && handleDelete(d.id)}>
+                      <Trash2 className="w-4 h-4" />
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}

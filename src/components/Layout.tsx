@@ -1,0 +1,144 @@
+import { useEffect, useRef, useState } from "react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import dongbaekLogo from "@/assets/dongbaek-logo.png";
+import { useAuth } from "@/hooks/useAuth";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+import { InstallAppButton } from "@/components/InstallAppButton";
+import { getAdjacentPath, getSwipeDirection, shouldIgnoreSwipeTarget, type SwipePoint } from "@/lib/swipeNavigation";
+import { fetchKpiWorkerUser } from "@/lib/kpiWorkerApi";
+
+type DirectorMenuState = "AUTH_LOADING" | "DIRECTOR_VERIFIED" | "NOT_DIRECTOR" | "UNAUTHENTICATED" | "AUTH_ERROR";
+
+const navItems = [
+  { path: "/", label: "대시보드", icon: "📊" },
+  { path: "/work-board", label: "업무 종합 보드", icon: "🗂️" },
+  { path: "/users", label: "이용자 관리", icon: "👤" },
+  { path: "/workers", label: "활동지원사 관리", icon: "🤝" },
+  { path: "/matching", label: "활동지원사 검색·비교", icon: "🔗" },
+  { path: "/counseling", label: "상담기록", icon: "📝" },
+  { path: "/terminations", label: "종결확인서", icon: "📄" },
+  { path: "/handovers", label: "인계·인수서", icon: "🔁" },
+  { path: "/salary-changes", label: "급여변경 사유서", icon: "💳" },
+  { path: "/event-forms", label: "행사·교육 신청", icon: "📋" },
+  { path: "/manual", label: "사용 매뉴얼", icon: "📘" },
+  { path: "/kpi", label: "KPI·슈퍼비전", icon: "📈", directorOnly: true },
+];
+
+const Layout = ({ children }: { children: React.ReactNode }) => {
+  const { logout, role, user } = useAuth();
+  const [directorMenuState, setDirectorMenuState] = useState<DirectorMenuState>("AUTH_LOADING");
+  useEffect(() => {
+    let active = true;
+    if (!user) { setDirectorMenuState("UNAUTHENTICATED"); return () => { active = false; }; }
+    if (role !== "admin") { setDirectorMenuState("NOT_DIRECTOR"); return () => { active = false; }; }
+    setDirectorMenuState("AUTH_LOADING");
+    void fetchKpiWorkerUser()
+      .then((workerUser) => { if (active) setDirectorMenuState(workerUser.role === "director" ? "DIRECTOR_VERIFIED" : "NOT_DIRECTOR"); })
+      .catch(() => { if (active) setDirectorMenuState("AUTH_ERROR"); });
+    return () => { active = false; };
+  }, [role, user]);
+  const visibleNavItems = navItems.filter((item) => !item.directorOnly || directorMenuState === "DIRECTOR_VERIFIED");
+  const location = useLocation();
+  const navigate = useNavigate();
+  const mobileNav = useRef<HTMLElement | null>(null);
+  const touchStart = useRef<SwipePoint | null>(null);
+  const [swipeDirection, setSwipeDirection] = useState<"left" | "right" | null>(null);
+
+  useEffect(() => {
+    setSwipeDirection(null);
+    mobileNav.current?.querySelector('[aria-current="page"]')?.scrollIntoView({ block: "nearest", inline: "center" });
+  }, [location.pathname]);
+
+  const handleTouchStart = (event: React.TouchEvent<HTMLElement>) => {
+    touchStart.current = null;
+    if (window.innerWidth >= 768 || event.touches.length !== 1 || shouldIgnoreSwipeTarget(event.target)) return;
+    const touch = event.touches[0];
+    touchStart.current = { x: touch.clientX, y: touch.clientY, at: Date.now() };
+  };
+
+  const handleTouchEnd = (event: React.TouchEvent<HTMLElement>) => {
+    const start = touchStart.current;
+    touchStart.current = null;
+    if (!start || event.changedTouches.length !== 1) return;
+    const touch = event.changedTouches[0];
+    const direction = getSwipeDirection(start, { x: touch.clientX, y: touch.clientY, at: Date.now() });
+    if (!direction) return;
+    const nextPath = getAdjacentPath(visibleNavItems.map((item) => item.path), location.pathname, direction);
+    if (!nextPath) return;
+    setSwipeDirection(direction);
+    window.setTimeout(() => navigate(nextPath), 120);
+  };
+
+  const renderNavLink = (item: (typeof navItems)[number], mobile = false) => {
+    const isActive = location.pathname === item.path;
+    return (
+      <Link
+        key={item.path}
+        to={item.path}
+        className={cn(
+          mobile
+            ? "relative inline-flex shrink-0 items-center gap-1.5 px-3 py-3 text-sm font-semibold transition-colors"
+            : "flex items-center gap-1.5 whitespace-nowrap rounded-full border px-3 py-2 text-sm font-medium transition-all",
+          isActive
+            ? mobile
+              ? "text-primary after:absolute after:bottom-0 after:left-3 after:right-3 after:h-0.5 after:rounded-full after:bg-primary"
+              : "border-primary/20 bg-primary/10 text-primary shadow-sm"
+            : mobile
+              ? "text-muted-foreground hover:text-foreground"
+              : "border-transparent text-muted-foreground hover:border-border hover:bg-muted hover:text-foreground"
+        )}
+        aria-current={isActive ? "page" : undefined}
+      >
+        <span>{item.icon}</span>
+        <span>{item.label}</span>
+      </Link>
+    );
+  };
+
+  return (
+    <div className="app-layout min-h-[100dvh] min-w-0 flex flex-col bg-background">
+      <header className="sticky top-0 z-40 border-b border-border/60 bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/80">
+        <div className="mx-auto flex w-full max-w-7xl flex-col gap-2 px-4 py-3 sm:px-6 lg:px-8">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-3">
+              <img src={dongbaekLogo} alt="동백" className="h-7 w-auto max-w-[100px] shrink-0 object-contain sm:h-8 sm:max-w-[140px]" />
+              <p className="truncate text-sm font-semibold text-foreground sm:text-base">동백 활동지원센터</p>
+            </div>
+
+            <nav className="hidden basis-full flex-wrap items-center gap-2 xl:order-3 xl:flex">
+              {visibleNavItems.map((item) => renderNavLink(item))}
+            </nav>
+
+            <div className="ml-auto flex shrink-0 items-center gap-2">
+            <InstallAppButton />
+            <Button
+              variant="ghost"
+              size="sm"
+              className="shrink-0 rounded-full text-xs text-muted-foreground hover:text-foreground sm:text-sm"
+              onClick={logout}
+            >
+              🚪 로그아웃
+            </Button>
+            </div>
+          </div>
+        </div>
+
+        <nav ref={mobileNav} className="xl:hidden border-t border-border/50 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" aria-label="모바일 주요 메뉴">
+          <div className="flex min-w-max px-2">
+            {visibleNavItems.map((item) => renderNavLink(item, true))}
+          </div>
+        </nav>
+      </header>
+
+      <main className="app-main min-w-0 flex-1" onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchCancel={() => { touchStart.current = null; }}>
+        <div className={cn("min-w-0 px-3 py-4 sm:p-4 md:p-6 max-w-7xl mx-auto animate-fade-in transition-all duration-150", swipeDirection === "left" && "-translate-x-4 opacity-60", swipeDirection === "right" && "translate-x-4 opacity-60")}>{children}</div>
+      </main>
+    </div>
+  );
+};
+
+export default Layout;
+
+
+
